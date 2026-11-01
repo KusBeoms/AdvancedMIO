@@ -15,6 +15,7 @@ struct AdvancedMIOApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
+        if CommandLine.arguments.contains("--probe") { Probe.run(); exit(0) }
         // Diagnostics for headless CI screenshots: can this machine resolve SF Symbols?
         if CommandLine.arguments.contains("--demo") {
             let names = ["play.fill", "waveform.path", "checkmark.circle.fill", "arrow.clockwise"]

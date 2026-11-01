@@ -20,6 +20,9 @@ jobs:
       - run: swift test
       - run: scripts/bundle.sh
       - run: codesign --verify --verbose build/AdvancedMIO.app
+      - name: CoreAudio probe
+        continue-on-error: true
+        run: build/AdvancedMIO.app/Contents/MacOS/AdvancedMIO --probe
       - name: Screenshot (demo mode)
         continue-on-error: true
         run: |
