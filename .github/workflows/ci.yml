@@ -38,6 +38,7 @@ jobs:
           }
           shoot demo --demo
           shoot drag --demo --demo-drag
+          cat /tmp/amio_symbols.txt || true
           ls -la shots
       - name: Publish screenshot
         if: github.ref_name != 'ci-screenshots'

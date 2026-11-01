@@ -185,12 +185,12 @@ final class AppModel: ObservableObject {
         }
         devices = [
             dev(1, "BlackHole 2ch", 2, 2, .virtual),
-            dev(2, "MacBook Pro 마이크", 1, 0, .builtIn),
-            dev(3, "Scarlett 2i2 USB", 2, 2, .usb),
             dev(4, "MacBook Pro 스피커", 0, 2, .builtIn),
             dev(5, "AirPods Pro", 1, 2, .bluetooth),
             dev(6, "LG UltraFine", 0, 2, .hdmi),
             dev(7, "Studio Display 스피커", 0, 2, .usb),
+            dev(2, "MacBook Pro 마이크", 1, 0, .builtIn),
+            dev(3, "Scarlett 2i2 USB", 2, 2, .usb),
         ]
         selectedInputs = ["BlackHole 2ch"]
         outputs = [
