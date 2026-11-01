@@ -116,8 +116,12 @@ struct ContentView: View {
             HStack {
                 sectionTitle("OUTPUTS", "기기별 지연 0–1000 ms")
                 Button { model.autoAlign() } label: {
-                    Label("자동 맞춤", systemImage: "wand.and.stars").font(.system(size: 11, weight: .semibold))
-                        .padding(.horizontal, 10).frame(height: 24)
+                    HStack(spacing: 5) {
+                        Symbol("wand.and.stars", size: 11)
+                        Text("자동 맞춤")
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 10).frame(height: 24)
                         .background(Capsule().fill(Color.white.opacity(0.09)))
                 }
                 .buttonStyle(.plain)

@@ -1,8 +1,19 @@
 import AppKit
 import SwiftUI
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)      // also when launched via `swift run` (no .app bundle)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    // Closing the window stops routing: there is no other UI to stop it with.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+}
+
 @main
 struct AdvancedMIOApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     init() {
         // Diagnostics for headless CI screenshots: can this machine resolve SF Symbols?
         if CommandLine.arguments.contains("--demo") {
