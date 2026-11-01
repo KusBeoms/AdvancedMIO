@@ -62,11 +62,11 @@ Tests/MIOCoreTests   25개 테스트
 
 ```bash
 swift test          # MIOCore 25개 테스트 (지연 정확도, 드리프트, 리샘플링, 크로스페이드, 채널 매핑, 햅틱 규칙 …)
-build/AdvancedMIO.app/Contents/MacOS/AdvancedMIO --probe   # CoreAudio 레이어 자가 진단 (장치 목록/포맷/레이턴시/루프백)
+build/AdvancedMIO.app/Contents/MacOS/AdvancedMIO --probe   # CoreAudio 레이어 자가 진단: 장치 목록/포맷/레이턴시 + 실제 IOProc 루프백(콜백 호출, 지연 1000 ms 적용 검증)
 AdvancedMIO --demo  # 가짜 장치로 UI 미리보기 (스크린샷용)
 ```
 
-GitHub Actions가 Linux(Swift 6.0)와 macOS 14에서 빌드·테스트·번들·서명 검증을 하고, 데모 모드 스크린샷을
+GitHub Actions가 Linux(Swift 6.0)와 macOS 14에서 빌드·테스트·번들·서명 검증과, 러너의 가상 오디오 장치(Apple Virtual Sound Device)를 이용한 `--probe` 루프백을 실행하고, 데모 모드 스크린샷을
 `ci-screenshots` 브랜치에 올립니다.
 
 ## 알려진 한계

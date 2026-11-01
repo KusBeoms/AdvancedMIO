@@ -26,9 +26,14 @@ enum Probe {
             Thread.sleep(forTimeInterval: 1)
             engine.diagnostics().forEach { print("  " + $0) }
             let healthy = engine.isHealthy
+            let lags = engine.outputLagsMs()
             engine.stop()
-            print("loopback: \(input.name) → \(output.name), delay 250→1000 ms: \(healthy ? "OK (callbacks fired, audio moved)" : "FAILED (no callbacks)")")
-            if !healthy { exit(1) }
+            // Requested 1000 ms: the lag must be that plus a small safety margin (output block + input chunk).
+            let lagOK = lags.allSatisfy { $0 >= 1000 && $0 <= 1100 }
+            print("loopback: \(input.name) → \(output.name), delay 250→1000 ms: lag \(lags.map { String(format: "%.1f", $0) }) ms")
+            print(healthy && lagOK ? "loopback: OK (callbacks fired, audio moved, delay applied)"
+                                   : "loopback: FAILED (healthy=\(healthy), lagOK=\(lagOK))")
+            if !(healthy && lagOK) { exit(1) }
         } catch {
             print("loopback: FAILED \(error.localizedDescription)")
             exit(1)

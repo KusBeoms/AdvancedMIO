@@ -152,6 +152,11 @@ final class RouterEngine {
         }
     }
 
+    /// Current read lag of each output in ms (delay + safety margin); used by `--probe`.
+    func outputLagsMs() -> [Double] {
+        outs.compactMap { $0.state.readers.first.map { $0.lagFrames / $0.ring.sampleRate * 1000 } }
+    }
+
     /// True when every IOProc has been called and moved audio.
     var isHealthy: Bool {
         ins.allSatisfy { $0.state.callbacks > 0 && $0.state.framesCaptured > 0 }
