@@ -67,20 +67,71 @@ struct DelayScrubber: View {
                 .fill(Color.white.opacity(hoverNumber || scrubStart != nil ? 0.14 : 0.07)))
         .onHover { inside in
             hoverNumber = inside
-            if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            if inside { NSCursor.resizeLeftRight.push(); startScrollMonitor() } else { NSCursor.pop(); stopScrollMonitor() }
         }
+        .onDisappear { stopScrollMonitor() }
+        .onChange(of: value) { target.value = $0 }
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { g in
                     if scrubStart == nil { scrubStart = value }
                     let f = NSEvent.modifierFlags
                     let scale = f.contains(.shift) ? 10.0 : (f.contains(.option) ? 0.25 : 1.0)
-                    apply((scrubStart ?? value) + Double(g.translation.width) * scale)
+                    // Right or up increases; left or down decreases.
+                    apply((scrubStart ?? value) + Double(g.translation.width - g.translation.height) * scale)
                 }
                 .onEnded { _ in scrubStart = nil }
         )
         .simultaneousGesture(TapGesture(count: 2).onEnded { apply(0) })
-        .help("좌우로 드래그해서 조절 · ⇧ 10배 · ⌥ 정밀 · 더블클릭 리셋")
+        .help("드래그(상하좌우)·스크롤로 조절 · ⇧ 10배 · ⌥ 정밀 · 더블클릭 리셋")
+    }
+
+    // MARK: Scroll wheel over the number
+
+    /// Reference state for the scroll monitor: the monitor outlives any one render of this struct, so it must read the
+    /// *latest* value from here rather than a captured (stale) copy.
+    private final class ScrollTarget {
+        var value = 0.0
+        var remainder = 0.0
+        var monitor: Any?
+        var onChange: (Double) -> Void = { _ in }
+    }
+    @State private var target = ScrollTarget()
+
+    private func startScrollMonitor() {
+        guard target.monitor == nil else { return }
+        let target = self.target, maxValue = self.maxValue
+        target.value = value
+        target.onChange = onChange
+        target.monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+            let dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
+            // Dominant axis wins: up / right increase, down / left decrease.
+            let vertical = abs(dy) >= abs(dx)
+            var d = vertical ? dy : -dx
+            if event.isDirectionInvertedFromDevice { d = -d }   // follow the physical gesture, not the "natural" flip
+            // Trackpad reports points (fine), wheels report lines (coarse).
+            let perUnit = event.hasPreciseScrollingDeltas ? 0.5 : 1.0
+            let mod = event.modifierFlags
+            let scale = mod.contains(.option) ? 0.25 : 1.0
+            target.remainder += Double(d) * perUnit * scale
+            let whole = target.remainder.rounded(.towardZero)
+            if whole != 0 {
+                target.remainder -= whole
+                let new = HapticPlanner.clamp(target.value + whole, limit: maxValue)
+                if new != target.value {
+                    Haptics.play(HapticPlanner.event(from: target.value, to: new, limit: maxValue))
+                    target.value = new
+                    target.onChange(new)
+                }
+            }
+            return nil
+        }
+    }
+
+    private func stopScrollMonitor() {
+        if let m = target.monitor { NSEvent.removeMonitor(m) }
+        target.monitor = nil
+        target.remainder = 0
     }
 
     private func roundButton(_ symbol: String, action: @escaping () -> Void) -> some View {

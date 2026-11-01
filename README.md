@@ -7,7 +7,7 @@ macOS용 **멀티 입력 / 멀티 출력 오디오 라우터**. 기본 *오디�
 
 ## 기능
 
-- **멀티 입력**: 입력 장치를 여러 개 골라 믹스 (장치마다 샘플레이트가 달라도 됨)
+- **가상 출력 장치 "AdvancedMIO"**: 제어 센터에서 고르기만 하면 시스템 소리가 앱으로 들어옴 (입력 선택 불필요)
 - **멀티 출력**: 출력 장치를 여러 개 동시에 재생. 출력별 볼륨, 레벨 미터
 - **기기별 싱크 지연 0–1000 ms** (1 ms 단위) — 블루투스 이어폰처럼 늦게 나오는 기기에 맞춰 다른 기기를 늦춤
   - 눈금자 위 드래그: 재생헤드가 포인터를 따라감 (⌥ 누르면 ¼ 속도 정밀 모드)
@@ -25,23 +25,24 @@ scripts/bundle.sh && open build/AdvancedMIO.app   # 아이콘 포함 .app 생성
 swift run -c release
 ```
 
-처음 실행하면 **마이크 권한**을 허용하세요 (입력 장치 캡처에 필요).
+처음 실행하면 **마이크 권한**을 허용하세요 (가상 장치 캡처에 필요).
 
-## 시스템 소리 보내기
+## 시스템 소리 보내기 (가상 출력 장치)
 
-macOS는 "모든 앱의 소리"를 직접 캡처하는 API를 장치처럼 제공하지 않으므로 가상 장치가 필요합니다.
+AdvancedMIO는 자체 가상 오디오 장치 **"AdvancedMIO"** 를 만듭니다 (CoreAudio AudioServerPlugIn, `driver/`).
+입력 장치를 고를 필요가 없습니다.
 
-1. [BlackHole 2ch](https://existential.audio/blackhole/) 설치
-2. 시스템 설정 ▸ 사운드 ▸ 출력을 **BlackHole 2ch** 로
-3. AdvancedMIO에서 입력 = BlackHole 2ch, 출력 = 실제 스피커/이어폰들 → **시작**
+1. 앱을 열고 왼쪽 **드라이버 설치** 클릭 (관리자 암호 필요, 한 번만). 또는 `scripts/install-driver.sh`
+2. **제어 센터 ▸ 소리**(또는 시스템 설정 ▸ 사운드)에서 출력을 **AdvancedMIO** 로 선택
+3. 앱 오른쪽에서 실제로 소리를 낼 장치를 켜고 기기별 지연 조절 (앱이 켜져 있어야 소리가 납니다)
 
-입력으로 선택한 장치는 출력으로 쓸 수 없습니다 (자기 자신으로 되돌아가는 하울링 방지).
+제거: `scripts/install-driver.sh --uninstall`
 
 ## 동작 방식
 
 ```
-입력 장치 ─ IOProc ─▶ StereoRing ─┬─ DelayReader(지연 a) ─┐
-입력 장치 ─ IOProc ─▶ StereoRing ─┤                       ├─ 합산 ─ IOProc ─▶ 출력 장치 A
+AdvancedMIO 가상 장치(입력) ─ IOProc ─▶ StereoRing ─┬─ DelayReader(지연 a) ─┐
+                                          ┤                       ├─ 합산 ─ IOProc ─▶ 출력 장치 A
                                    └─ DelayReader(지연 a') ┘
                                     … 출력마다 자기 지연값으로 독립적으로 읽음
 ```
@@ -54,6 +55,7 @@ macOS는 "모든 앱의 소리"를 직접 캡처하는 API를 장치처럼 제�
 
 ```
 Sources/MIOCore      플랫폼 독립 DSP (링 버퍼, DelayReader, 채널 매핑, 햅틱 규칙)  ← Linux/macOS 모두에서 테스트
+driver/              가상 오디오 장치 (C, AudioServerPlugIn: 출력으로 받은 소리를 입력으로 루프백)
 Sources/AdvancedMIO  CoreAudio HAL, 엔진, SwiftUI UI
 Tests/MIOCoreTests   25개 테스트
 ```
@@ -76,4 +78,6 @@ GitHub Actions가 Linux(Swift 6.0)와 macOS 14에서 빌드·테스트·번들·
 - 장치의 샘플레이트가 실행 중에 바뀌면 재시작이 필요합니다.
 - 32-bit float PCM이 아닌 스트림(비표준 HAL 설정)은 지원하지 않고 오류로 알립니다.
 - 블루투스 장치의 보고 지연은 실제와 다를 수 있어 *자동 맞춤* 후 수동 미세조정이 필요할 수 있습니다.
+- 가상 장치는 48 kHz 스테레오 고정이며 볼륨 키/슬라이더(시스템 음량)는 지원하지 않습니다 — 음량은 앱의 출력별 슬라이더로 조절하세요.
+- 드라이버는 ad-hoc 서명이라 이 Mac에서 직접 빌드·설치하는 용도입니다. 설치 직후 장치가 안 보이면 재시작하세요.
 - 앱 서명은 ad-hoc 입니다. 다른 Mac에 배포하려면 Developer ID 서명/공증이 필요합니다.

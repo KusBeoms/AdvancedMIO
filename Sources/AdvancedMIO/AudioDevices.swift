@@ -64,6 +64,17 @@ struct IOError: LocalizedError {
 }
 
 enum HAL {
+    /// Number of other processes currently playing to the AdvancedMIO virtual device (driver-defined property 'amip').
+    /// nil when the installed driver predates the property.
+    static func playbackClients(_ id: AudioDeviceID) -> UInt32? {
+        var addr = AudioObjectPropertyAddress(mSelector: 0x616D6970, mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) == noErr else { return nil }
+        return value
+    }
+
     private static func address(_ sel: AudioObjectPropertySelector, _ scope: AudioObjectPropertyScope) -> AudioObjectPropertyAddress {
         AudioObjectPropertyAddress(mSelector: sel, mScope: scope, mElement: kAudioObjectPropertyElementMain)
     }

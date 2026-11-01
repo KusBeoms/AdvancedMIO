@@ -15,19 +15,31 @@ final class AppModel: ObservableObject {
     nonisolated static let maxDelayMs = DelayReader.maxDelayMs
 
     @Published private(set) var devices: [AudioDeviceInfo] = []
-    @Published private(set) var selectedInputs: Set<String> = []
     @Published private(set) var outputs: [String: OutputConfig] = [:]
+    /// The user switched routing on. The engine itself (and the macOS mic indicator) only runs while something plays.
     @Published private(set) var running = false
+    /// The engine is actually capturing right now.
+    @Published private(set) var capturing = false
     @Published private(set) var busy = false
     @Published var error: String?
     @Published private(set) var hwLatencyMs: [String: Double] = [:]
 
     private var engine: RouterEngine?
+    private var pollTimer: Timer?
+    private var idleSince: Date?
+    private static let idleGrace: TimeInterval = 3
     private var saveTask: Task<Void, Never>?
     private var listenerBlock: AudioObjectPropertyListenerBlock?
 
-    var inputDevices: [AudioDeviceInfo] { devices.filter(\.isInput) }
-    var outputDevices: [AudioDeviceInfo] { devices.filter(\.isOutput) }
+    /// UID of the virtual device the AdvancedMIO driver publishes (see driver/AdvancedMIODriver.c).
+    nonisolated static let virtualUID = "AdvancedMIO_Device"
+    static let driverInstallPath = "/Library/Audio/Plug-Ins/HAL/AdvancedMIO.driver"
+
+    /// The virtual "AdvancedMIO" device: what the user picks in Control Center. Its loopback input is our only source.
+    var virtualDevice: AudioDeviceInfo? { devices.first { $0.uid == Self.virtualUID && $0.isInput } }
+    /// Real outputs only; the virtual device itself would feed back into the router.
+    var outputDevices: [AudioDeviceInfo] { devices.filter { $0.isOutput && $0.uid != Self.virtualUID } }
+    @Published private(set) var installing = false
 
     private var demo = false
 
@@ -35,11 +47,11 @@ final class AppModel: ObservableObject {
         if CommandLine.arguments.contains("--demo") { loadDemo(); return }
         if let d = UserDefaults.standard.data(forKey: "state.v1"),
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
-            selectedInputs = s.inputs
             outputs = s.outputs
         }
         refresh()
         installDeviceListener()
+        if virtualDevice != nil, outputs.values.contains(where: \.enabled) { arm() }   // ready as soon as it's picked in Control Center
     }
 
     // MARK: Devices
@@ -66,9 +78,9 @@ final class AppModel: ObservableObject {
         refresh()
         guard running else { return }
         let present = Set(devices.map(\.uid))
-        let used = selectedInputs.union(outputs.filter { $0.value.enabled }.keys)
+        let used = Set(outputs.filter { $0.value.enabled }.keys).union([Self.virtualUID])
         if !used.isSubset(of: present) {
-            stopEngine()
+            disarm()
             error = "사용 중이던 오디오 장치가 분리되어 정지했습니다"
         }
     }
@@ -95,18 +107,39 @@ final class AppModel: ObservableObject {
     func setEnabled(_ uid: String, _ on: Bool) {
         var c = config(uid); c.enabled = on; outputs[uid] = c
         scheduleSave()
-        if running { start() }
+        if running { rebuildEngine() }
     }
 
-    func toggleInput(_ uid: String) {
-        if selectedInputs.contains(uid) { selectedInputs.remove(uid) } else { selectedInputs.insert(uid) }
-        scheduleSave()
-        if running { start() }
-    }
+    // MARK: Driver install
 
-    /// An output can't also be an active input (it would feed back into itself).
-    func isBlockedOutput(_ uid: String) -> Bool { selectedInputs.contains(uid) }
-    func isBlockedInput(_ uid: String) -> Bool { outputs[uid]?.enabled == true && !selectedInputs.contains(uid) }
+    /// Copies the bundled driver into /Library/Audio/Plug-Ins/HAL (admin password prompt) and restarts coreaudiod.
+    func installDriver() {
+        guard !installing else { return }
+        guard let src = Bundle.main.url(forResource: "AdvancedMIO.driver", withExtension: nil)?.path else {
+            error = "앱 안에 드라이버가 없습니다 — scripts/bundle.sh 로 만든 앱인지 확인하세요"
+            return
+        }
+        installing = true
+        error = nil
+        let dest = Self.driverInstallPath
+        let cmd = "rm -rf '\(dest)' && cp -R '\(src)' '\(dest)' && chown -R root:wheel '\(dest)' && (killall coreaudiod || true)"
+        Task.detached {
+            let script = "do shell script \"\(cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
+            var info: NSDictionary?
+            NSAppleScript(source: script)?.executeAndReturnError(&info)
+            let failure = (info?[NSAppleScript.errorMessage] as? String)
+            // coreaudiod needs a moment to come back and publish the device.
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            await MainActor.run {
+                self.installing = false
+                if let failure { self.error = "드라이버 설치 실패: \(failure)" }
+                self.refresh()
+                if self.virtualDevice == nil, failure == nil {
+                    self.error = "설치는 끝났지만 장치가 아직 보이지 않습니다. 몇 초 뒤 새로고침하거나 Mac을 재시작하세요"
+                }
+            }
+        }
+    }
 
     /// Offsets every enabled output so they all land at the same time as the slowest one (based on reported HW latency).
     func autoAlign() {
@@ -121,25 +154,56 @@ final class AppModel: ObservableObject {
 
     // MARK: Run
 
-    func toggleRunning() { running ? stopEngine() : start() }
+    func toggleRunning() { running ? disarm() : arm() }
 
-    func start() {
-        guard !busy else { return }
+    /// Turn routing on: the engine starts as soon as something plays to the AdvancedMIO device.
+    func arm() {
+        running = true
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
+        tick()
+    }
+
+    func disarm() {
+        pollTimer?.invalidate(); pollTimer = nil
+        running = false
+        stopEngine()
+    }
+
+    private func tick() {
+        guard running else { return }
+        // An older driver without the playback counter: always capture.
+        let clients = virtualDevice.flatMap { HAL.playbackClients($0.id) }
+        let playing = clients.map { $0 > 0 } ?? true
+        if playing {
+            idleSince = nil
+            if engine == nil { rebuildEngine() }
+        } else if engine != nil {
+            let since = idleSince ?? Date()
+            idleSince = since
+            if Date().timeIntervalSince(since) > Self.idleGrace { stopEngine() }
+        }
+    }
+
+    private func rebuildEngine() {
+        guard !busy, running else { return }
         busy = true
         Task {
             defer { busy = false }
             error = nil
-            guard await ensureMicAccess() else { return }
+            guard await ensureMicAccess() else { disarm(); return }
             stopEngine()
-            let ins = inputDevices.filter { selectedInputs.contains($0.uid) }
-            let outs = outputDevices.filter { config($0.uid).enabled && !selectedInputs.contains($0.uid) }
-            guard !ins.isEmpty else { error = "입력 장치를 하나 이상 선택하세요"; return }
+            guard let virtual = virtualDevice else { error = "AdvancedMIO 가상 장치가 설치되어 있지 않습니다"; return }
+            let ins = [virtual]
+            let outs = outputDevices.filter { config($0.uid).enabled }
             guard !outs.isEmpty else { error = "출력 장치를 하나 이상 켜세요"; return }
             do {
                 let e = try RouterEngine(inputs: ins, outputs: outs.map { ($0, config($0.uid)) })
                 try e.start()
                 engine = e
-                running = true
+                capturing = true
             } catch {
                 self.error = error.localizedDescription
             }
@@ -148,7 +212,7 @@ final class AppModel: ObservableObject {
 
     private func stopEngine() {
         engine?.stop(); engine = nil
-        running = false
+        capturing = false
     }
 
     private func ensureMicAccess() async -> Bool {
@@ -188,11 +252,10 @@ final class AppModel: ObservableObject {
             dev(5, "AirPods Pro", 0, 2, .bluetooth),
             dev(6, "LG UltraFine", 0, 2, .hdmi),
             dev(7, "Studio Display 스피커", 0, 2, .usb),
-            dev(1, "BlackHole 2ch", 2, 2, .virtual),
+            dev(1, AppModel.virtualUID, 2, 2, .virtual),
             dev(2, "MacBook Pro 마이크", 1, 0, .builtIn),
             dev(3, "Scarlett 2i2 USB", 2, 2, .usb),
         ]
-        selectedInputs = ["BlackHole 2ch"]
         outputs = [
             "MacBook Pro 스피커": OutputConfig(enabled: true, delayMs: 0, volume: 0.9),
             "AirPods Pro": OutputConfig(enabled: true, delayMs: 180, volume: 0.7),
@@ -200,20 +263,21 @@ final class AppModel: ObservableObject {
             "Studio Display 스피커": OutputConfig(enabled: false, delayMs: 0, volume: 1),
         ]
         hwLatencyMs = ["MacBook Pro 스피커": 14, "AirPods Pro": 192, "LG UltraFine": 38, "Studio Display 스피커": 21,
-                       "BlackHole 2ch": 5, "Scarlett 2i2 USB": 9]
+                       AppModel.virtualUID: 5, "Scarlett 2i2 USB": 9]
         running = true
+        capturing = true
     }
 
     // MARK: Persistence
 
-    private struct Saved: Codable { var inputs: Set<String>; var outputs: [String: OutputConfig] }
+    private struct Saved: Codable { var outputs: [String: OutputConfig] }
     private func scheduleSave() {
         guard !demo else { return }
         saveTask?.cancel()
-        saveTask = Task { [selectedInputs, outputs] in
+        saveTask = Task { [outputs] in
             try? await Task.sleep(nanoseconds: 400_000_000)
             guard !Task.isCancelled else { return }
-            if let d = try? JSONEncoder().encode(Saved(inputs: selectedInputs, outputs: outputs)) {
+            if let d = try? JSONEncoder().encode(Saved(outputs: outputs)) {
                 UserDefaults.standard.set(d, forKey: "state.v1")
             }
         }
