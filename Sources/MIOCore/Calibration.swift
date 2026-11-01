@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Accelerate)
+import Accelerate
+#endif
 
 // Room auto-calibration math (platform independent; the hardware orchestration lives in the app target).
 //
@@ -10,12 +13,19 @@ import Foundation
 
 // MARK: - FFT
 
-/// In-place radix-2 complex FFT.
+/// In-place complex FFT. On Apple platforms sizes ≥ 64 run on Accelerate's vDSP DFT (several times faster); the portable
+/// radix-2 implementation is used elsewhere (Linux CI) and for tiny sizes. Both give the same numbers.
 public final class FFT {
     public let size: Int
     private let cosT: [Double]
     private let sinT: [Double]
     private let rev: [Int]
+    #if canImport(Accelerate)
+    private let fwd: vDSP_DFT_SetupD?
+    private let inv: vDSP_DFT_SetupD?
+    /// Set to false to force the portable path (used by tests to compare the two).
+    public nonisolated(unsafe) static var useAccelerate = true
+    #endif
 
     public init(size: Int) {
         precondition(size >= 2 && size & (size - 1) == 0, "FFT size must be a power of two")
@@ -30,10 +40,36 @@ public final class FFT {
             r[i] = y
         }
         rev = r
+        #if canImport(Accelerate)
+        fwd = size >= 64 ? vDSP_DFT_zop_CreateSetupD(nil, vDSP_Length(size), .FORWARD) : nil
+        inv = size >= 64 ? vDSP_DFT_zop_CreateSetupD(nil, vDSP_Length(size), .INVERSE) : nil
+        #endif
+    }
+
+    deinit {
+        #if canImport(Accelerate)
+        if let fwd { vDSP_DFT_DestroySetupD(fwd) }
+        if let inv { vDSP_DFT_DestroySetupD(inv) }
+        #endif
     }
 
     public func transform(_ re: inout [Double], _ im: inout [Double], inverse: Bool = false) {
         precondition(re.count == size && im.count == size)
+        #if canImport(Accelerate)
+        if FFT.useAccelerate, let setup = inverse ? inv : fwd {
+            var outRe = [Double](repeating: 0, count: size), outIm = outRe
+            re.withUnsafeBufferPointer { ri in im.withUnsafeBufferPointer { ii in
+                vDSP_DFT_ExecuteD(setup, ri.baseAddress!, ii.baseAddress!, &outRe, &outIm)
+            } }
+            if inverse {
+                let s = 1 / Double(size)
+                for i in 0..<size { re[i] = outRe[i] * s; im[i] = outIm[i] * s }
+            } else {
+                re = outRe; im = outIm
+            }
+            return
+        }
+        #endif
         for i in 0..<size {
             let j = rev[i]
             if j > i { re.swapAt(i, j); im.swapAt(i, j) }
@@ -411,7 +447,7 @@ extension CalibrationAnalysis {
     public static func identify(recording: [Float], sampleRate fs: Double, trials: [JointTrial], probes: [[Float]],
                                 speakerCount n: Int, padSec: Double = 0.1, tailSec: Double = 1.2, irSec: Double = 0.3,
                                 minSNR: Double = 8, regularization: Double = 1e-3,
-                                continuous: Bool = false) -> MicResponse {
+                                continuous: Bool = false, lsRegularization: Double = 1e-3) -> MicResponse {
         let K = trials.count
         precondition(K == probes.count && K >= n && n >= 1, "need at least as many trials as speakers")
         let none = MicResponse(sampleRate: fs, speakers: Array(repeating: nil, count: n))
@@ -422,75 +458,112 @@ extension CalibrationAnalysis {
         let N = FFT.nextPowerOfTwo(winLen + probeLen)
         let half = N / 2 + 1
         let fft = FFT(size: N)
+        let twoPiOverN = 2 * Double.pi / Double(N)
 
-        var gre = [[Double]](), gim = [[Double]](), wts = [[Double]]()
+        // Probe spectra and weights (once) and the raw recording windows.
+        var Xr = [[Double]](), Xi = [[Double]](), Wt = [[Double]](), Eps = [Double]()
+        var raw = [[Double]]()
         for k in 0..<K {
-            var xr = [Double](repeating: 0, count: N), xi = xr, yr = xr, yi = xr
+            var xr = [Double](repeating: 0, count: N), xi = xr
             for i in 0..<probes[k].count { xr[i] = Double(probes[k][i]) }
-            let lo = Int(trials[k].startSec * fs) - pad
-            for i in 0..<winLen { let j = lo + i; if j >= 0 && j < recording.count { yr[i] = Double(recording[j]) } }
-            fft.transform(&xr, &xi); fft.transform(&yr, &yi)
+            fft.transform(&xr, &xi)
             var mean = 0.0
             for b in 0..<half { mean += xr[b] * xr[b] + xi[b] * xi[b] }
             let eps = regularization * mean / Double(half)
-            var a = [Double](repeating: 0, count: half), c = a, w = a
-            for b in 0..<half {
-                let p = xr[b] * xr[b] + xi[b] * xi[b]
-                a[b] = (yr[b] * xr[b] + yi[b] * xi[b]) / (p + eps)
-                c[b] = (yi[b] * xr[b] - yr[b] * xi[b]) / (p + eps)
-                w[b] = p / (p + eps)
+            Wt.append((0..<half).map { b in let p = xr[b] * xr[b] + xi[b] * xi[b]; return p / (p + eps) })
+            Xr.append(Array(xr[0..<half])); Xi.append(Array(xi[0..<half])); Eps.append(eps)
+            let lo = Int(trials[k].startSec * fs) - pad
+            raw.append((0..<winLen).map { i in let j = lo + i; return j >= 0 && j < recording.count ? Double(recording[j]) : 0 })
+        }
+        let gainOf = trials.map(\.gains), delayOf = trials.map { $0.delaysMs.map { $0 / 1000 * fs } }
+
+        /// Per-bin phasors e^{-jω d_ik} for every (trial, speaker), advanced bin by bin (no trigonometry in the inner loops).
+        struct Phasors {
+            var cr: [Double], ci: [Double], sr: [Double], si: [Double]
+            init(count: Int) { cr = [Double](repeating: 1, count: count); ci = [Double](repeating: 0, count: count); sr = cr; si = ci }
+        }
+        func phasors(at b: Int, _ ph: inout Phasors, _ stepC: [Double], _ stepS: [Double]) {
+            if b % 2048 == 0 {                                    // exact value now and then keeps rounding error from drifting
+                for q in 0..<(K * n) {
+                    let ang = -twoPiOverN * Double(b) * delayOf[q / n][q % n]
+                    ph.cr[q] = cos(ang); ph.ci[q] = sin(ang)
+                }
+            } else {
+                for q in 0..<(K * n) {
+                    let nc = ph.cr[q] * stepC[q] - ph.ci[q] * stepS[q]
+                    ph.ci[q] = ph.cr[q] * stepS[q] + ph.ci[q] * stepC[q]
+                    ph.cr[q] = nc
+                }
             }
-            gre.append(a); gim.append(c); wts.append(w)
+        }
+        let stepC = (0..<(K * n)).map { cos(-twoPiOverN * delayOf[$0 / n][$0 % n]) }
+        let stepS = (0..<(K * n)).map { sin(-twoPiOverN * delayOf[$0 / n][$0 % n]) }
+
+        /// Least-squares separation of the speakers from the given recording windows.
+        func solve(_ wins: [[Double]]) -> (hre: [[Double]], him: [[Double]], fit: Double) {
+            var gre = [[Double]](), gim = [[Double]]()
+            for k in 0..<K {
+                var yr = [Double](repeating: 0, count: N), yi = yr
+                for i in 0..<winLen { yr[i] = wins[k][i] }
+                fft.transform(&yr, &yi)
+                var a = [Double](repeating: 0, count: half), c = a
+                for b in 0..<half {
+                    let p = Xr[k][b] * Xr[k][b] + Xi[k][b] * Xi[k][b] + Eps[k]
+                    a[b] = (yr[b] * Xr[k][b] + yi[b] * Xi[k][b]) / p
+                    c[b] = (yi[b] * Xr[k][b] - yr[b] * Xi[k][b]) / p
+                }
+                gre.append(a); gim.append(c)
+            }
+            var hre = [[Double]](repeating: [Double](repeating: 0, count: N), count: n)
+            var him = hre
+            var mr = [Double](repeating: 0, count: n * n), mi = mr
+            var rr = [Double](repeating: 0, count: n), ri = rr
+            var ar = [Double](repeating: 0, count: K * n), ai = ar
+            var num = 0.0, den = 0.0
+            var ph = Phasors(count: K * n)
+            for b in 0..<half {
+                phasors(at: b, &ph, stepC, stepS)
+                for q in 0..<(K * n) { ar[q] = gainOf[q / n][q % n] * ph.cr[q]; ai[q] = gainOf[q / n][q % n] * ph.ci[q] }
+                for i in 0..<(n * n) { mr[i] = 0; mi[i] = 0 }
+                for i in 0..<n { rr[i] = 0; ri[i] = 0 }
+                for k in 0..<K {
+                    let w = Wt[k][b]
+                    if w < 1e-9 { continue }
+                    let gr = gre[k][b], gi = gim[k][b]
+                    for i in 0..<n {
+                        let ari = ar[k * n + i], aii = ai[k * n + i]
+                        for j in 0..<n {
+                            let arj = ar[k * n + j], aij = ai[k * n + j]
+                            mr[i * n + j] += w * (ari * arj + aii * aij)
+                            mi[i * n + j] += w * (ari * aij - aii * arj)
+                        }
+                        rr[i] += w * (ari * gr + aii * gi)
+                        ri[i] += w * (ari * gi - aii * gr)
+                    }
+                }
+                var tr = 0.0
+                for i in 0..<n { tr += mr[i * n + i] }
+                let lam = lsRegularization * tr / Double(n) + 1e-12
+                for i in 0..<n { mr[i * n + i] += lam }
+                let sol = solveComplex(&mr, &mi, &rr, &ri, n)
+                for i in 0..<n { hre[i][b] = sol.0[i]; him[i][b] = sol.1[i] }
+                for k in 0..<K {
+                    let w = Wt[k][b]
+                    if w < 1e-9 { continue }
+                    var pr = 0.0, pi = 0.0
+                    for i in 0..<n {
+                        pr += ar[k * n + i] * sol.0[i] - ai[k * n + i] * sol.1[i]
+                        pi += ar[k * n + i] * sol.1[i] + ai[k * n + i] * sol.0[i]
+                    }
+                    let er = gre[k][b] - pr, ei = gim[k][b] - pi
+                    num += w * (er * er + ei * ei); den += w * (gre[k][b] * gre[k][b] + gim[k][b] * gim[k][b])
+                }
+            }
+            return (hre, him, max(0, min(1, 1 - num / max(den, 1e-18))))
         }
 
-        var hre = [[Double]](repeating: [Double](repeating: 0, count: N), count: n)
-        var him = hre
-        var mr = [Double](repeating: 0, count: n * n), mi = mr
-        var rr = [Double](repeating: 0, count: n), ri = rr
-        var ar = rr, ai = rr
-        var num = 0.0, den = 0.0
-        let twoPiOverN = 2 * Double.pi / Double(N)
-        for b in 0..<half {
-            for i in 0..<(n * n) { mr[i] = 0; mi[i] = 0 }
-            for i in 0..<n { rr[i] = 0; ri[i] = 0 }
-            for k in 0..<K {
-                let w = wts[k][b]
-                if w < 1e-9 { continue }
-                for i in 0..<n {
-                    let ph = twoPiOverN * Double(b) * (trials[k].delaysMs[i] / 1000 * fs)
-                    ar[i] = trials[k].gains[i] * cos(ph); ai[i] = -trials[k].gains[i] * sin(ph)
-                }
-                let gr = gre[k][b], gi = gim[k][b]
-                for i in 0..<n {
-                    for j in 0..<n {
-                        mr[i * n + j] += w * (ar[i] * ar[j] + ai[i] * ai[j])
-                        mi[i * n + j] += w * (ar[i] * ai[j] - ai[i] * ar[j])
-                    }
-                    rr[i] += w * (ar[i] * gr + ai[i] * gi)
-                    ri[i] += w * (ar[i] * gi - ai[i] * gr)
-                }
-            }
-            var tr = 0.0
-            for i in 0..<n { tr += mr[i * n + i] }
-            let lam = 1e-3 * tr / Double(n) + 1e-12
-            for i in 0..<n { mr[i * n + i] += lam }
-            let sol = solveComplex(&mr, &mi, &rr, &ri, n)
-            for i in 0..<n { hre[i][b] = sol.0[i]; him[i][b] = sol.1[i] }
-            // Fit quality: weighted residual of the model against the per-trial transfer functions.
-            for k in 0..<K {
-                let w = wts[k][b]
-                if w < 1e-9 { continue }
-                var pr = 0.0, pi = 0.0
-                for i in 0..<n {
-                    let ph = twoPiOverN * Double(b) * (trials[k].delaysMs[i] / 1000 * fs)
-                    let cr = trials[k].gains[i] * cos(ph), ci = -trials[k].gains[i] * sin(ph)
-                    pr += cr * sol.0[i] - ci * sol.1[i]; pi += cr * sol.1[i] + ci * sol.0[i]
-                }
-                let er = gre[k][b] - pr, ei = gim[k][b] - pi
-                num += w * (er * er + ei * ei); den += w * (gre[k][b] * gre[k][b] + gim[k][b] * gim[k][b])
-            }
-        }
-        let fit = max(0, min(1, 1 - num / max(den, 1e-18)))
+        let result = solve(raw)
+        let hre = result.hre, him = result.him, fit = result.fit
 
         let pre = max(1, Int(0.001 * fs))
         let speakers: [SpeakerIR?] = (0..<n).map { i in

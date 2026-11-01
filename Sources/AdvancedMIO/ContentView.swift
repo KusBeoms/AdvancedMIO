@@ -1,7 +1,10 @@
 import SwiftUI
 
+enum SideTab { case source, spatial }
+
 struct ContentView: View {
     @StateObject private var model = AppModel()
+    @State private var sideTab: SideTab = CommandLine.arguments.contains("--demo-spatial") ? .spatial : .source
 
     var body: some View {
         ZStack {
@@ -103,10 +106,30 @@ struct ContentView: View {
 
     private var sourceColumn: some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionTitle("SOURCE", "시스템 출력")
-            SourceCard().environmentObject(model)
+            HStack(spacing: 6) {
+                sideTabButton(.source, "SOURCE")
+                sideTabButton(.spatial, "공간음향")
+                Spacer()
+                if model.spatialOn { Text("ON").font(.system(size: 10, weight: .bold)).foregroundStyle(Theme.cyan) }
+            }
+            .padding(.horizontal, 4)
+            switch sideTab {
+            case .source: SourceCard().environmentObject(model)
+            case .spatial: SpatialCard().environmentObject(model)
+            }
             Spacer(minLength: 0)
         }
+    }
+
+    private func sideTabButton(_ tab: SideTab, _ title: String) -> some View {
+        let selected = sideTab == tab
+        return Button { sideTab = tab } label: {
+            Text(title).font(.system(size: 11, weight: .bold)).tracking(selected ? 1.2 : 0.8)
+                .foregroundStyle(selected ? Color.white : Theme.text2)
+                .padding(.horizontal, 11).frame(height: 24)
+                .background(Capsule().fill(selected ? Theme.violet.opacity(0.6) : Color.white.opacity(0.06)))
+        }
+        .buttonStyle(.plain)
     }
 
     private var outputsColumn: some View {

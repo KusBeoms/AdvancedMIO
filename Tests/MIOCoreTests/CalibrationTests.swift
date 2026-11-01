@@ -260,4 +260,101 @@ final class CalibrationTests: XCTestCase {
         XCTAssertEqual(s[1], 0.6 / 1.6, accuracy: 0.01)
         XCTAssertLessThan(s[2], 0.01)
     }
+
+    #if canImport(Accelerate)
+    func testAcceleratedFFTMatchesThePortableOne() {
+        for size in [64, 1024, 65536] {
+            var rng = LCG(s: UInt64(size))
+            let re0 = (0..<size).map { _ in rng.next() }, im0 = (0..<size).map { _ in rng.next() }
+            let fft = FFT(size: size)
+            FFT.useAccelerate = false
+            var ar = re0, ai = im0
+            fft.transform(&ar, &ai); let fr = ar, fi = ai
+            fft.transform(&ar, &ai, inverse: true)
+            FFT.useAccelerate = true
+            var br = re0, bi = im0
+            fft.transform(&br, &bi)
+            for i in 0..<size { XCTAssertEqual(br[i], fr[i], accuracy: 1e-8 * Double(size)); XCTAssertEqual(bi[i], fi[i], accuracy: 1e-8 * Double(size)) }
+            fft.transform(&br, &bi, inverse: true)
+            for i in 0..<size { XCTAssertEqual(br[i], re0[i], accuracy: 1e-9); XCTAssertEqual(ar[i], re0[i], accuracy: 1e-9) }
+        }
+    }
+
+    func testAcceleratedFFTIsSafeFromSeveralThreadsAndFaster() {
+        let size = 131072
+        let fft = FFT(size: size)
+        var rng = LCG(s: 5)
+        let re0 = (0..<size).map { _ in rng.next() }
+        var ref = re0, refI = [Double](repeating: 0, count: size)
+        fft.transform(&ref, &refI)
+        var bad = 0
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: 16) { _ in
+            var r = re0, i = [Double](repeating: 0, count: size)
+            for _ in 0..<5 { r = re0; i = [Double](repeating: 0, count: size); fft.transform(&r, &i) }
+            if abs(r[1234] - ref[1234]) > 1e-6 || abs(i[777] - refI[777]) > 1e-6 { lock.lock(); bad += 1; lock.unlock() }
+        }
+        XCTAssertEqual(bad, 0)
+        func time(_ acc: Bool) -> Double {
+            FFT.useAccelerate = acc
+            var r = re0, i = [Double](repeating: 0, count: size)
+            let t = Date()
+            for _ in 0..<20 { r = re0; i = [Double](repeating: 0, count: size); fft.transform(&r, &i) }
+            return Date().timeIntervalSince(t) / 20
+        }
+        let slow = time(false), fast = time(true)
+        FFT.useAccelerate = true
+        print("FFTBENCH 131072-point: portable \(slow * 1000) ms, accelerate \(fast * 1000) ms (\(slow / fast)x)")
+    }
+    #endif
+
+    // MARK: Model refinement and volume balance
+
+    func testVolumeBalanceSuggestsLoudeningTheSpeakerThatIsQuietAtAMicrophone() {
+        // Two microphones, two speakers. Mic 0 is next to speaker 0, mic 1 next to speaker 1, but speaker 1 is 8 dB quieter.
+        let power: [[Double]] = [[1.0, 0.1], [0.05, 0.16]]
+        let s = try! XCTUnwrap(VolumeBalance.suggest(power: power))
+        XCTAssertLessThan(s.spreadAfterDb, s.spreadBeforeDb)
+        XCTAssertGreaterThan(s.gainsDb[1], s.gainsDb[0], "the quiet speaker should be raised relative to the loud one")
+        XCTAssertEqual(s.gainsDb.reduce(0, +), 0, accuracy: 1e-9)
+        XCTAssertNil(VolumeBalance.suggest(power: [[1, 1]]), "one microphone cannot say anything about evenness")
+    }
+
+    func testVolumeBalanceLeavesAnEvenRoomAlone() {
+        let s = try! XCTUnwrap(VolumeBalance.suggest(power: [[1, 1], [1, 1], [1, 1]]))
+        XCTAssertTrue(s.gainsDb.allSatisfy { abs($0) < 0.51 })
+        XCTAssertLessThan(s.spreadBeforeDb, 0.01)
+    }
+
+    /// A model whose speaker 1 arrival is 9 ms off; the measured combined response has it where it really is.
+    func testModelRefinerFindsAMisTimedSpeakerAndLeavesTheCorrectOnesAlone() throws {
+        let fs = 8000.0
+        func model(_ arrivals: [Double]) -> MicResponse {
+            let pre = max(1, Int(0.001 * fs)), len = Int(0.2 * fs)
+            return MicResponse(sampleRate: fs, speakers: arrivals.enumerated().map { i, a in
+                var h = [Double](repeating: 0, count: pre + len)
+                h[pre] = 1.0; h[pre + 1] = -0.5 + 0.1 * Double(i); h[pre + 2] = 0.3
+                return SpeakerIR(h: h, pre: pre, arrival: a, snr: 100, consistency: 1)
+            })
+        }
+        let truth = model([0.030, 0.071, 0.120]), assumed = model([0.030, 0.062, 0.120])
+        let delays = [40.0, 0.0, 15.0]
+        let n = 8192, pad = 800
+        var ir = [Float](repeating: 0, count: pad + n)
+        var rng = LCG(s: 4)
+        for (i, sp) in truth.speakers.enumerated() {
+            let start = pad + Int(((sp!.arrival + delays[i] / 1000) * fs).rounded()) - sp!.pre
+            for (j, v) in sp!.h.prefix(sp!.pre + 80).enumerated() { ir[start + j] += Float(v) }
+        }
+        for t in 0..<ir.count { ir[t] += Float(0.02 * rng.next()) }           // noise / tails
+        let obs = [Observation(mic: 0, delaysMs: delays, ir: ir, pad: pad)]
+        let e = try XCTUnwrap(ModelRefiner.estimate(model: [assumed], observations: obs))
+        XCTAssertEqual(e.biasMs[1], 9, accuracy: 0.6)
+        XCTAssertEqual(e.biasMs[0], 0, accuracy: 0.3)
+        XCTAssertEqual(e.biasMs[2], 0, accuracy: 0.3)
+        XCTAssertLessThan(e.costAfter, e.costZero)
+        // A correct model: no correction.
+        let ok = try XCTUnwrap(ModelRefiner.estimate(model: [truth], observations: obs))
+        XCTAssertTrue(ok.biasMs.allSatisfy { abs($0) < 0.3 })
+    }
 }

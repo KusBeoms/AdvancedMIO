@@ -57,6 +57,9 @@ private final class OutputState {
     let refs = UnsafeMutablePointer<BufferRef>.allocate(capacity: maxBuffers)
     var level: Float = 0
     var callbacks = 0, framesRendered = 0
+    /// Spatial placement: written from the UI thread, ramped across each block on the audio thread.
+    var mixTarget = SpatialMix.identity
+    private var mixNow = SpatialMix.identity
 
     init(readers: [DelayReader]) {
         self.readers = readers
@@ -83,6 +86,19 @@ private final class OutputState {
         framesRendered += frames
         for i in 0..<frames { l[i] = 0; r[i] = 0 }
         for rd in readers { rd.render(into: l, r, frames: frames) }
+        let m0 = mixNow, m1 = mixTarget
+        mixNow = m1
+        if m0 != .identity || m1 != .identity {
+            let inv = 1 / Float(frames)
+            for i in 0..<frames {
+                let k = Float(i) * inv
+                let ll = m0.ll + (m1.ll - m0.ll) * k, lr = m0.lr + (m1.lr - m0.lr) * k
+                let rl = m0.rl + (m1.rl - m0.rl) * k, rr = m0.rr + (m1.rr - m0.rr) * k
+                let a = l[i], b = r[i]
+                l[i] = ll * a + lr * b
+                r[i] = rl * a + rr * b
+            }
+        }
         var peak: Float = 0
         for i in 0..<frames {
             l[i] = max(-1, min(1, l[i])); r[i] = max(-1, min(1, r[i]))   // hard safety clip after summing inputs
@@ -192,6 +208,7 @@ final class RouterEngine {
 
     func setDelay(uid: String, ms: Double) { outs.first { $0.device.uid == uid }?.state.setDelay(ms: ms) }
     func setGain(uid: String, _ g: Float) { outs.first { $0.device.uid == uid }?.state.setGain(g) }
+    func setMix(uid: String, _ m: SpatialMix) { outs.first { $0.device.uid == uid }?.state.mixTarget = m }
     func inputLevel(uid: String) -> Float { ins.first { $0.device.uid == uid }?.state.level ?? shared?.level ?? 0 }
     func outputLevel(uid: String) -> Float { outs.first { $0.device.uid == uid }?.state.level ?? 0 }
 

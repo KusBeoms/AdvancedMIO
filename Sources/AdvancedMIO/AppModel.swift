@@ -10,9 +10,15 @@ struct OutputConfig: Codable, Equatable {
     var auto = true
     var manualLagMs: Double = 0
     var volume: Double = 1
+    /// Spatial audio: place on the circle (nil = the default slot for this device) and how far the speaker is
+    /// turned away from facing the listener.
+    var angleDeg: Double?
+    var aimOffsetDeg: Double = 0
 
-    init(enabled: Bool = false, auto: Bool = true, manualLagMs: Double = 0, volume: Double = 1) {
+    init(enabled: Bool = false, auto: Bool = true, manualLagMs: Double = 0, volume: Double = 1,
+         angleDeg: Double? = nil, aimOffsetDeg: Double = 0) {
         self.enabled = enabled; self.auto = auto; self.manualLagMs = manualLagMs; self.volume = volume
+        self.angleDeg = angleDeg; self.aimOffsetDeg = aimOffsetDeg
     }
 
     // Tolerant of older saves (which stored a differently-meaning `delayMs`/`lagMs`; those are dropped).
@@ -22,6 +28,8 @@ struct OutputConfig: Codable, Equatable {
         auto = try c.decodeIfPresent(Bool.self, forKey: .auto) ?? true
         manualLagMs = try c.decodeIfPresent(Double.self, forKey: .manualLagMs) ?? 0
         volume = min(1, max(0, try c.decodeIfPresent(Double.self, forKey: .volume) ?? 1))   // old saves went up to 200 %
+        angleDeg = try c.decodeIfPresent(Double.self, forKey: .angleDeg)
+        aimOffsetDeg = try c.decodeIfPresent(Double.self, forKey: .aimOffsetDeg) ?? 0
     }
 }
 
@@ -63,6 +71,59 @@ final class AppModel: ObservableObject {
 
     private var demo = false
 
+    // Spatial audio (see SpatialView): each enabled output is a point on a circle around the listener.
+    @Published private(set) var spatialOn = false
+    @Published private(set) var listenerHeadingDeg = 0.0
+
+    /// Enabled outputs in a stable order (the order the default slots are handed out in).
+    var enabledOutputs: [AudioDeviceInfo] { outputDevices.filter { config($0.uid).enabled } }
+
+    /// Where this speaker stands on the circle: the user's placement, else its default slot.
+    func spatialAngle(_ uid: String) -> Double {
+        if let a = config(uid).angleDeg { return a }
+        let list = enabledOutputs
+        guard let i = list.firstIndex(where: { $0.uid == uid }) else { return 0 }
+        return SpatialPanner.defaultAngles(count: list.count)[i]
+    }
+    func spatialAimOffset(_ uid: String) -> Double { config(uid).aimOffsetDeg }
+
+    func setSpatialOn(_ on: Bool) {
+        spatialOn = on
+        pushMixes()
+        scheduleSave()
+    }
+    func setListenerHeading(_ deg: Double) {
+        listenerHeadingDeg = SpatialPanner.normalized(deg)
+        pushMixes()
+        scheduleSave()
+    }
+    func setSpatialAngle(_ uid: String, _ deg: Double) {
+        var c = config(uid); c.angleDeg = SpatialPanner.normalized(deg)
+        commit(uid, c)
+    }
+    func setSpatialAimOffset(_ uid: String, _ deg: Double) {
+        var c = config(uid); c.aimOffsetDeg = SpatialPanner.normalized(deg)
+        commit(uid, c)
+    }
+    func resetSpatial() {
+        for uid in outputs.keys { outputs[uid]?.angleDeg = nil; outputs[uid]?.aimOffsetDeg = 0 }
+        listenerHeadingDeg = 0
+        pushMixes()
+        scheduleSave()
+    }
+
+    /// Sends every speaker its placement mix (identity when spatial audio is off). The calibration test engine is
+    /// left alone: it must measure the plain stereo signal.
+    private func pushMixes() {
+        guard let engine else { return }
+        for d in enabledOutputs {
+            let m = spatialOn
+                ? SpatialPanner.mix(positionDeg: spatialAngle(d.uid), aimOffsetDeg: spatialAimOffset(d.uid), headingDeg: listenerHeadingDeg)
+                : SpatialMix.identity
+            engine.setMix(uid: d.uid, m)
+        }
+    }
+
     // Calibration (see CalibrationRunner / CalibrationView)
     enum CalPhase { case idle, setup, running, done, failed }
     @Published private(set) var calPhase: CalPhase = .idle
@@ -70,8 +131,19 @@ final class AppModel: ObservableObject {
     @Published private(set) var calFraction = 0.0
     @Published private(set) var calReport: CalibrationReport?
     @Published private(set) var calError: String?
-    @Published var calMics: Set<String> = []
+    /// The one microphone the calibration listens with.
+    @Published private(set) var calMics: Set<String> = []
+    func selectCalMic(_ uid: String) { calMics = [uid] }
     private var calTask: Task<Void, Never>?
+    private var calControl = CalibrationControl()
+    private var calStarted = Date()
+    /// Seconds left according to the estimate (nil once it is overrun: "wrapping up").
+    @Published private(set) var calRemaining: Double?
+    /// Best measured improvement so far while the search runs (0…1).
+    @Published private(set) var calBestSoFar: Double?
+    /// The search has started, so "finish now with the best so far" makes sense.
+    @Published private(set) var calCanFinishEarly = false
+    @Published private(set) var calFinishRequested = false
     private var testEngine: RouterEngine?
     private var presetVolumes: [String: Double] = [:]
 
@@ -109,6 +181,8 @@ final class AppModel: ObservableObject {
         if let d = UserDefaults.standard.data(forKey: "state.v1"),
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
             outputs = s.outputs
+            spatialOn = s.spatialOn ?? false
+            listenerHeadingDeg = s.listenerHeadingDeg ?? 0
         }
         refresh()
         installDeviceListener()
@@ -204,6 +278,7 @@ final class AppModel: ObservableObject {
             guard let e else { continue }
             for d in outputDevices where config(d.uid).enabled { e.setDelay(uid: d.uid, ms: appliedDelayMs(d.uid)) }
         }
+        pushMixes()     // placements change whenever the set of enabled outputs does (default slots)
     }
 
     func setVolume(_ uid: String, _ v: Double) {
@@ -273,9 +348,8 @@ final class AppModel: ObservableObject {
         guard canCalibrate else { return }
         error = nil; calError = nil; calReport = nil
         presetVolumes = Dictionary(uniqueKeysWithValues: calSpeakers.map { ($0.uid, deviceVolume($0.uid)) })
-        if calMics.isEmpty || !calMics.isSubset(of: Set(micDevices.map(\.uid))) {
-            calMics = Set(micDevices.filter { $0.transport == .builtIn }.map(\.uid))
-            if calMics.isEmpty, let m = micDevices.first { calMics = [m.uid] }
+        if calMics.count != 1 || !calMics.isSubset(of: Set(micDevices.map(\.uid))) {
+            if let m = micDevices.first(where: { $0.transport == .builtIn }) ?? micDevices.first { calMics = [m.uid] } else { calMics = [] }
         }
         stopEngine()
         calPhase = .setup
@@ -299,15 +373,78 @@ final class AppModel: ObservableObject {
     func calStartFresh() { for d in calSpeakers { setDeviceVolume(d.uid, 0.5) } }
     var calVolumesChanged: Bool { calSpeakers.contains { abs(deviceVolume($0.uid) - (presetVolumes[$0.uid] ?? 1)) > 0.005 } }
 
+    /// "Finish now": stop measuring after the current measurement and use the best setting found so far.
+    func finishCalibrationEarly() {
+        guard calPhase == .running, calControl.searching else { return }
+        calControl.requestFinish()
+        calFinishRequested = true
+    }
+
+    // MARK: Listening to before / after
+
+    private var listenSong: LoopSource?
+    @Published private(set) var calListening: Bool?        // nil = not playing, false = original, true = calibrated
+
+    /// Plays the test song through the speakers with the original (false) or the calibrated (true) delays, switching live.
+    func calListen(calibrated: Bool) {
+        guard let r = calReport else { return }
+        let delays = calibrated ? r.outcome.delaysMs : r.originalDelaysMs
+        if let e = testEngine {
+            for (i, uid) in r.speakerUIDs.enumerated() where i < delays.count { e.setDelay(uid: uid, ms: delays[i]) }
+            calListening = calibrated
+            return
+        }
+        do {
+            let song = try listenSong ?? TestSound.load()
+            listenSong = song
+            let outs: [(AudioDeviceInfo, Double, Double)] = r.speakerUIDs.enumerated().compactMap { i, uid in
+                guard let d = devices.first(where: { $0.uid == uid }), i < delays.count else { return nil }
+                return (d, delays[i], digitalVolume(uid))
+            }
+            let e = try RouterEngine(inputs: [], shared: song, outputs: outs)
+            try e.start()
+            testEngine = e
+            calListening = calibrated
+        } catch { calError = error.localizedDescription }
+    }
+
+    func stopListening() {
+        testEngine?.stop(); testEngine = nil
+        calListening = nil
+    }
+
+    /// The user's verdict after listening to both. Kept (with the measured improvement) to see how the index relates to ears.
+    @Published private(set) var calFeedbackGiven = false
+    func recordFeedback(better: String) {
+        guard let r = calReport else { return }
+        var log = UserDefaults.standard.array(forKey: "calibration.feedback") as? [[String: Any]] ?? []
+        log.append(["better": better, "measured": r.measuredImprovement ?? NSNull(), "date": Date().timeIntervalSince1970])
+        UserDefaults.standard.set(log, forKey: "calibration.feedback")
+        calFeedbackGiven = true
+    }
+    /// (agreeing, total) over the saved verdicts: "calibrated is better" agrees with a measured improvement.
+    var feedbackAgreement: (agree: Int, total: Int) {
+        let log = UserDefaults.standard.array(forKey: "calibration.feedback") as? [[String: Any]] ?? []
+        var agree = 0, total = 0
+        for e in log {
+            guard let b = e["better"] as? String, b != "same", let m = e["measured"] as? Double else { continue }
+            total += 1
+            if (b == "calibrated") == (m > 0.02) { agree += 1 }
+        }
+        return (agree, total)
+    }
+
     func closeCalibration() {
         calTask?.cancel(); calTask = nil
         testEngine?.stop(); testEngine = nil
+        calListening = nil; calFeedbackGiven = false
         calPhase = .idle
         if running { tick() }
     }
 
     func backToCalibrationSetup() {
         calError = nil
+        calListening = nil; calFeedbackGiven = false
         calPhase = .setup
         startTestSong()
     }
@@ -320,12 +457,26 @@ final class AppModel: ObservableObject {
             calError = nil; calFraction = 0; calStatus = "준비 중…"
             calPhase = .running
             let speakers = calSpeakers.map { CalibrationSpeaker(device: $0, appliedDelayMs: appliedDelayMs($0.uid), volume: digitalVolume($0.uid)) }
-            let mics = micDevices.filter { calMics.contains($0.uid) }
+            let mics = Array(micDevices.filter { calMics.contains($0.uid) }.prefix(1))
+            let control = CalibrationControl()
+            calControl = control
+            calStarted = Date()
+            calBestSoFar = nil; calCanFinishEarly = false; calFinishRequested = false; calRemaining = calEstimate
+            let estimate = CalibrationRunner.estimatedSeconds(speakers: speakers.count, mics: mics.count,
+                                                             maxDelayMs: (speakers.map(\.appliedDelayMs).max() ?? 0) + 50)
             do {
-                let report = try await CalibrationRunner().run(speakers: speakers, mics: mics) { [weak self] text, frac in
-                    Task { @MainActor in self?.calStatus = text; self?.calFraction = frac }
+                let report = try await CalibrationRunner().run(speakers: speakers, mics: mics, control: control) { [weak self] text, frac in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        self.calStatus = text; self.calFraction = frac
+                        let left = estimate - Date().timeIntervalSince(self.calStarted)
+                        self.calRemaining = left > 3 ? left : nil
+                        self.calBestSoFar = control.improvement
+                        self.calCanFinishEarly = control.searching
+                    }
                 }
                 calReport = report
+                stopListening()
                 calPhase = .done
             } catch is CancellationError {
             } catch {
@@ -408,6 +559,7 @@ final class AppModel: ObservableObject {
                 let e = try RouterEngine(inputs: ins, shared: shared, outputs: outs.map { ($0, appliedDelayMs($0.uid), digitalVolume($0.uid)) })
                 try e.start()
                 engine = e
+                pushMixes()
                 if !e.failures.isEmpty {
                     error = e.failures.map { "\($0.name) 출력 실패: \($0.message)" }.joined(separator: "\n")
                 }
@@ -474,15 +626,22 @@ final class AppModel: ObservableObject {
                        AppModel.virtualUID: 5, "Scarlett 2i2 USB": 9]
         running = true
         capturing = true
+        spatialOn = true
+        outputs["AirPods Pro"]?.angleDeg = 120
+        outputs["AirPods Pro"]?.aimOffsetDeg = 35
     }
 
     // MARK: Persistence
 
-    private struct Saved: Codable { var outputs: [String: OutputConfig] }
+    private struct Saved: Codable {
+        var outputs: [String: OutputConfig]
+        var spatialOn: Bool?
+        var listenerHeadingDeg: Double?
+    }
     /// Written immediately: the app quits as soon as the last window closes, so a debounce would drop the last change.
     private func scheduleSave() {
         guard !demo else { return }
-        if let d = try? JSONEncoder().encode(Saved(outputs: outputs)) {
+        if let d = try? JSONEncoder().encode(Saved(outputs: outputs, spatialOn: spatialOn, listenerHeadingDeg: listenerHeadingDeg)) {
             UserDefaults.standard.set(d, forKey: "state.v1")
         }
     }
