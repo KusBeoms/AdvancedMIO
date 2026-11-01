@@ -19,7 +19,7 @@ enum Probe {
             return
         }
         do {
-            let engine = try RouterEngine(inputs: [input], outputs: [(output, OutputConfig(enabled: true, delayMs: 250, volume: 0))])
+            let engine = try RouterEngine(inputs: [input], outputs: [(output, 250, 0)])
             try engine.start()
             Thread.sleep(forTimeInterval: 2)
             engine.setDelay(uid: output.uid, ms: 1000)

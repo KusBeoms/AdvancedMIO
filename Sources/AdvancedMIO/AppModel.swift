@@ -6,12 +6,29 @@ import SwiftUI
 
 struct OutputConfig: Codable, Equatable {
     var enabled = false
-    var delayMs: Double = 0
+    /// On: this device's lag is the hardware-reported latency. Off: `manualLagMs` is used instead.
+    var auto = true
+    var manualLagMs: Double = 0
     var volume: Double = 1
+
+    init(enabled: Bool = false, auto: Bool = true, manualLagMs: Double = 0, volume: Double = 1) {
+        self.enabled = enabled; self.auto = auto; self.manualLagMs = manualLagMs; self.volume = volume
+    }
+
+    // Tolerant of older saves (which stored a differently-meaning `delayMs`/`lagMs`; those are dropped).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        auto = try c.decodeIfPresent(Bool.self, forKey: .auto) ?? true
+        manualLagMs = try c.decodeIfPresent(Double.self, forKey: .manualLagMs) ?? 0
+        volume = min(1, max(0, try c.decodeIfPresent(Double.self, forKey: .volume) ?? 1))   // old saves went up to 200 %
+    }
 }
 
 @MainActor
 final class AppModel: ObservableObject {
+    /// Per-output volume is 0…100 (1 = unity). The system volume (AdvancedMIO device) tops out at unity.
+    nonisolated static let maxVolume = 1.0
     nonisolated static let maxDelayMs = DelayReader.maxDelayMs
 
     @Published private(set) var devices: [AudioDeviceInfo] = []
@@ -28,7 +45,6 @@ final class AppModel: ObservableObject {
     private var pollTimer: Timer?
     private var idleSince: Date?
     private static let idleGrace: TimeInterval = 3
-    private var saveTask: Task<Void, Never>?
     private var listenerBlock: AudioObjectPropertyListenerBlock?
 
     /// UID of the virtual device the AdvancedMIO driver publishes (see driver/AdvancedMIODriver.c).
@@ -40,8 +56,53 @@ final class AppModel: ObservableObject {
     /// Real outputs only; the virtual device itself would feed back into the router.
     var outputDevices: [AudioDeviceInfo] { devices.filter { $0.isOutput && $0.uid != Self.virtualUID } }
     @Published private(set) var installing = false
+    /// Audio from the driver's shared memory (no microphone indicator). nil → older driver, falls back to capturing the input.
+    private var shared: SharedRingSource?
+    /// The installed driver is too old to publish shared memory (and has no system volume control).
+    @Published private(set) var driverOutdated = false
 
     private var demo = false
+
+    // Calibration (see CalibrationRunner / CalibrationView)
+    enum CalPhase { case idle, setup, running, done, failed }
+    @Published private(set) var calPhase: CalPhase = .idle
+    @Published private(set) var calStatus = ""
+    @Published private(set) var calFraction = 0.0
+    @Published private(set) var calReport: CalibrationReport?
+    @Published private(set) var calError: String?
+    @Published var calMics: Set<String> = []
+    private var calTask: Task<Void, Never>?
+    private var testEngine: RouterEngine?
+    private var presetVolumes: [String: Double] = [:]
+
+    // Per-device volume: the real device's own hardware volume when it has one; virtual devices and devices
+    // without one use a digital gain inside the router.
+    @Published private(set) var hwVolume: [String: Double] = [:]
+    private var hwTimer: Timer?
+
+    func refreshHardwareVolumes() {
+        var next: [String: Double] = [:]
+        // Virtual / aggregate devices report a volume control that does not change what is heard: those are always
+        // adjusted in software (digital gain inside the router).
+        for d in outputDevices where d.transport != .virtual && d.transport != .aggregate {
+            if let v = HAL.hardwareVolume(d.id) { next[d.uid] = Double(v) }
+        }
+        if next.count != hwVolume.count || next.contains(where: { abs((hwVolume[$0.key] ?? -1) - $0.value) > 0.004 }) { hwVolume = next }
+    }
+    /// What the slider shows: the device's own volume if it has one, else the router's digital volume.
+    func deviceVolume(_ uid: String) -> Double { hwVolume[uid] ?? config(uid).volume }
+    /// The gain applied inside the router: unity for devices whose own volume is controlled directly.
+    func digitalVolume(_ uid: String) -> Double { hwVolume[uid] != nil ? 1 : config(uid).volume }
+    func usesHardwareVolume(_ uid: String) -> Bool { hwVolume[uid] != nil }
+
+    func setDeviceVolume(_ uid: String, _ v: Double) {
+        let v = min(1, max(0, v))
+        if hwVolume[uid] != nil, let d = devices.first(where: { $0.uid == uid }), HAL.setHardwareVolume(d.id, Float(v)) {
+            hwVolume[uid] = v
+        } else {
+            setVolume(uid, v)
+        }
+    }
 
     init() {
         if CommandLine.arguments.contains("--demo") { loadDemo(); return }
@@ -51,6 +112,9 @@ final class AppModel: ObservableObject {
         }
         refresh()
         installDeviceListener()
+        hwTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshHardwareVolumes() }     // follows changes made elsewhere (keys, Sound settings)
+        }
         if virtualDevice != nil, outputs.values.contains(where: \.enabled) { arm() }   // ready as soon as it's picked in Control Center
     }
 
@@ -61,6 +125,10 @@ final class AppModel: ObservableObject {
         var lat: [String: Double] = [:]
         for d in devices where d.isOutput { if let ms = HAL.outputLatencyMs(d.id) { lat[d.uid] = ms } }
         hwLatencyMs = lat
+        refreshHardwareVolumes()
+        if shared == nil { shared = SharedRingSource.open() }
+        driverOutdated = !demo && virtualDevice != nil && shared == nil
+        pushDelays()
     }
 
     private func installDeviceListener() {
@@ -89,24 +157,66 @@ final class AppModel: ObservableObject {
 
     func config(_ uid: String) -> OutputConfig { outputs[uid] ?? OutputConfig() }
 
-    func setDelay(_ uid: String, _ ms: Double) {
+    /// The lag this device is assumed to have: its reported hardware latency (auto) or the user's value (manual).
+    /// This is what the slider shows; every other output is delayed to match the laggiest one.
+    func totalLag(_ uid: String) -> Double {
+        let c = config(uid)
+        return HapticPlanner.clamp(c.auto ? (hwLatencyMs[uid] ?? 0) : c.manualLagMs, limit: Self.maxDelayMs)
+    }
+
+    /// Dragging the slider takes the device out of auto.
+    func setTotalLag(_ uid: String, _ ms: Double) {
         var c = config(uid)
-        c.delayMs = HapticPlanner.clamp(ms, limit: Self.maxDelayMs)
+        c.auto = false
+        c.manualLagMs = HapticPlanner.clamp(ms, limit: Self.maxDelayMs)
+        commit(uid, c)
+    }
+
+    /// Turning auto off keeps the slider where it is, so the value can be nudged from there.
+    func setAuto(_ uid: String, _ on: Bool) {
+        var c = config(uid)
+        if !on { c.manualLagMs = totalLag(uid) }
+        c.auto = on
+        commit(uid, c)
+    }
+
+    private func commit(_ uid: String, _ c: OutputConfig) {
         guard c != config(uid) || outputs[uid] == nil else { return }
         outputs[uid] = c
-        engine?.setDelay(uid: uid, ms: c.delayMs)
+        pushDelays()
         scheduleSave()
     }
 
+    /// Delay applied to an output so that it lands together with the laggiest enabled one (which gets 0).
+    func appliedDelayMs(_ uid: String) -> Double {
+        let worst = outputDevices.filter { config($0.uid).enabled }.map { totalLag($0.uid) }.max() ?? 0
+        return HapticPlanner.clamp(worst - totalLag(uid), limit: Self.maxDelayMs)
+    }
+
+    /// The enabled output that everything else is waiting for.
+    func isReference(_ uid: String) -> Bool {
+        config(uid).enabled && appliedDelayMs(uid) < 0.5
+            && outputDevices.filter { config($0.uid).enabled }.count > 1
+    }
+
+    private func pushDelays() {
+        for e in [engine, testEngine] {
+            guard let e else { continue }
+            for d in outputDevices where config(d.uid).enabled { e.setDelay(uid: d.uid, ms: appliedDelayMs(d.uid)) }
+        }
+    }
+
     func setVolume(_ uid: String, _ v: Double) {
-        var c = config(uid); c.volume = min(1, max(0, v)); outputs[uid] = c
-        engine?.setGain(uid: uid, Float(c.volume))
+        var c = config(uid); c.volume = min(Self.maxVolume, max(0, v)); outputs[uid] = c
+        engine?.setGain(uid: uid, Float(digitalVolume(uid)))
+        testEngine?.setGain(uid: uid, Float(digitalVolume(uid)))
         scheduleSave()
     }
 
     func setEnabled(_ uid: String, _ on: Bool) {
         var c = config(uid); c.enabled = on; outputs[uid] = c
         scheduleSave()
+        pushDelays()
         if running { rebuildEngine() }
     }
 
@@ -141,16 +251,107 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Offsets every enabled output so they all land at the same time as the slowest one (based on reported HW latency).
-    func autoAlign() {
-        let active = outputDevices.filter { config($0.uid).enabled }
-        let lat = active.compactMap { d in hwLatencyMs[d.uid].map { (d.uid, $0) } }
-        guard let slowest = lat.map(\.1).max() else { return }
-        for (uid, ms) in lat { setDelay(uid, slowest - ms) }
+    /// Puts every device back on its reported hardware latency.
+    func allAuto() {
+        for uid in outputs.keys { outputs[uid]?.auto = true }
+        pushDelays()
+        scheduleSave()
         Haptics.major()
     }
 
-    var canAutoAlign: Bool { outputDevices.filter { config($0.uid).enabled && hwLatencyMs[$0.uid] != nil }.count >= 2 }
+    var canAllAuto: Bool { outputs.values.contains { !$0.auto } }
+
+    // MARK: Calibration
+
+    var micDevices: [AudioDeviceInfo] { devices.filter { $0.isInput && $0.uid != Self.virtualUID } }
+    var calSpeakers: [AudioDeviceInfo] { outputDevices.filter { config($0.uid).enabled } }
+    var canCalibrate: Bool { !demo && calPhase == .idle && calSpeakers.count >= 2 && !micDevices.isEmpty }
+    var calEstimate: Double { CalibrationRunner.estimatedSeconds(speakers: calSpeakers.count, mics: max(1, calMics.count)) }
+
+    /// Opens the setup window: the test song plays through every enabled speaker so the volumes can be balanced by ear.
+    func openCalibration() {
+        guard canCalibrate else { return }
+        error = nil; calError = nil; calReport = nil
+        presetVolumes = Dictionary(uniqueKeysWithValues: calSpeakers.map { ($0.uid, deviceVolume($0.uid)) })
+        if calMics.isEmpty || !calMics.isSubset(of: Set(micDevices.map(\.uid))) {
+            calMics = Set(micDevices.filter { $0.transport == .builtIn }.map(\.uid))
+            if calMics.isEmpty, let m = micDevices.first { calMics = [m.uid] }
+        }
+        stopEngine()
+        calPhase = .setup
+        startTestSong()
+    }
+
+    private func startTestSong() {
+        testEngine?.stop(); testEngine = nil
+        do {
+            let song = try TestSound.load()
+            let outs = calSpeakers.map { ($0, appliedDelayMs($0.uid), digitalVolume($0.uid)) }
+            let e = try RouterEngine(inputs: [], shared: song, outputs: outs)
+            try e.start()
+            testEngine = e
+        } catch { calError = error.localizedDescription }
+    }
+
+    /// Back to the volumes the speakers had when the window opened.
+    func calUsePreset() { for (uid, v) in presetVolumes { setDeviceVolume(uid, v) } }
+    /// A fresh start: everything at 50 %, to be balanced from scratch.
+    func calStartFresh() { for d in calSpeakers { setDeviceVolume(d.uid, 0.5) } }
+    var calVolumesChanged: Bool { calSpeakers.contains { abs(deviceVolume($0.uid) - (presetVolumes[$0.uid] ?? 1)) > 0.005 } }
+
+    func closeCalibration() {
+        calTask?.cancel(); calTask = nil
+        testEngine?.stop(); testEngine = nil
+        calPhase = .idle
+        if running { tick() }
+    }
+
+    func backToCalibrationSetup() {
+        calError = nil
+        calPhase = .setup
+        startTestSong()
+    }
+
+    func startMeasurement() {
+        guard calPhase == .setup, !calMics.isEmpty else { return }
+        calTask = Task {
+            guard await ensureMicAccess() else { calError = error; calPhase = .failed; return }
+            testEngine?.stop(); testEngine = nil
+            calError = nil; calFraction = 0; calStatus = "준비 중…"
+            calPhase = .running
+            let speakers = calSpeakers.map { CalibrationSpeaker(device: $0, appliedDelayMs: appliedDelayMs($0.uid), volume: digitalVolume($0.uid)) }
+            let mics = micDevices.filter { calMics.contains($0.uid) }
+            do {
+                let report = try await CalibrationRunner().run(speakers: speakers, mics: mics) { [weak self] text, frac in
+                    Task { @MainActor in self?.calStatus = text; self?.calFraction = frac }
+                }
+                calReport = report
+                calPhase = .done
+            } catch is CancellationError {
+            } catch {
+                calError = error.localizedDescription
+                calPhase = .failed
+            }
+        }
+    }
+
+    /// Makes the solved delays the current setting. Volumes are left exactly as the user set them.
+    func applyCalibration() {
+        guard let r = calReport else { return }
+        let delays = r.outcome.delaysMs
+        // Slider values are absolute lags; the router delays every speaker to the laggiest one, so lag_i = M − delay_i.
+        let m = max(delays.max() ?? 0, calSpeakers.map { totalLag($0.uid) }.max() ?? 0)
+        for (i, uid) in r.speakerUIDs.enumerated() where i < delays.count {
+            var c = config(uid)
+            c.auto = false
+            c.manualLagMs = HapticPlanner.clamp(m - delays[i], limit: Self.maxDelayMs)
+            outputs[uid] = c
+        }
+        pushDelays()
+        scheduleSave()
+        Haptics.major()
+        closeCalibration()
+    }
 
     // MARK: Run
 
@@ -173,10 +374,13 @@ final class AppModel: ObservableObject {
     }
 
     private func tick() {
-        guard running else { return }
-        // An older driver without the playback counter: always capture.
-        let clients = virtualDevice.flatMap { HAL.playbackClients($0.id) }
-        let playing = clients.map { $0 > 0 } ?? true
+        guard running, calPhase == .idle else { return }
+        if shared == nil { shared = SharedRingSource.open() }
+        // Shared memory: audio is flowing when the driver's write position moved. Otherwise ask the driver how many
+        // clients play; an older driver without that counter means we simply always capture.
+        let playing: Bool
+        if let shared { playing = shared.pollActivity() }
+        else { playing = virtualDevice.flatMap { HAL.playbackClients($0.id) }.map { $0 > 0 } ?? true }
         if playing {
             idleSince = nil
             if engine == nil { rebuildEngine() }
@@ -188,21 +392,25 @@ final class AppModel: ObservableObject {
     }
 
     private func rebuildEngine() {
-        guard !busy, running else { return }
+        guard !busy, running, calPhase == .idle else { return }
         busy = true
         Task {
             defer { busy = false }
             error = nil
-            guard await ensureMicAccess() else { disarm(); return }
-            stopEngine()
             guard let virtual = virtualDevice else { error = "AdvancedMIO 가상 장치가 설치되어 있지 않습니다"; return }
-            let ins = [virtual]
+            // Shared memory needs neither microphone permission nor an input stream (so no orange indicator).
+            if shared == nil { guard await ensureMicAccess() else { disarm(); return } }
+            stopEngine()
+            let ins = shared == nil ? [virtual] : []
             let outs = outputDevices.filter { config($0.uid).enabled }
             guard !outs.isEmpty else { error = "출력 장치를 하나 이상 켜세요"; return }
             do {
-                let e = try RouterEngine(inputs: ins, outputs: outs.map { ($0, config($0.uid)) })
+                let e = try RouterEngine(inputs: ins, shared: shared, outputs: outs.map { ($0, appliedDelayMs($0.uid), digitalVolume($0.uid)) })
                 try e.start()
                 engine = e
+                if !e.failures.isEmpty {
+                    error = e.failures.map { "\($0.name) 출력 실패: \($0.message)" }.joined(separator: "\n")
+                }
                 capturing = true
             } catch {
                 self.error = error.localizedDescription
@@ -257,10 +465,10 @@ final class AppModel: ObservableObject {
             dev(3, "Scarlett 2i2 USB", 2, 2, .usb),
         ]
         outputs = [
-            "MacBook Pro 스피커": OutputConfig(enabled: true, delayMs: 0, volume: 0.9),
-            "AirPods Pro": OutputConfig(enabled: true, delayMs: 180, volume: 0.7),
-            "LG UltraFine": OutputConfig(enabled: true, delayMs: 520, volume: 1),
-            "Studio Display 스피커": OutputConfig(enabled: false, delayMs: 0, volume: 1),
+            "MacBook Pro 스피커": OutputConfig(enabled: true, volume: 0.9),
+            "AirPods Pro": OutputConfig(enabled: true, volume: 0.7),
+            "LG UltraFine": OutputConfig(enabled: true, auto: false, manualLagMs: 80, volume: 1),
+            "Studio Display 스피커": OutputConfig(enabled: false, volume: 1),
         ]
         hwLatencyMs = ["MacBook Pro 스피커": 14, "AirPods Pro": 192, "LG UltraFine": 38, "Studio Display 스피커": 21,
                        AppModel.virtualUID: 5, "Scarlett 2i2 USB": 9]
@@ -271,15 +479,11 @@ final class AppModel: ObservableObject {
     // MARK: Persistence
 
     private struct Saved: Codable { var outputs: [String: OutputConfig] }
+    /// Written immediately: the app quits as soon as the last window closes, so a debounce would drop the last change.
     private func scheduleSave() {
         guard !demo else { return }
-        saveTask?.cancel()
-        saveTask = Task { [outputs] in
-            try? await Task.sleep(nanoseconds: 400_000_000)
-            guard !Task.isCancelled else { return }
-            if let d = try? JSONEncoder().encode(Saved(outputs: outputs)) {
-                UserDefaults.standard.set(d, forKey: "state.v1")
-            }
+        if let d = try? JSONEncoder().encode(Saved(outputs: outputs)) {
+            UserDefaults.standard.set(d, forKey: "state.v1")
         }
     }
 }

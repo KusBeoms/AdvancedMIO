@@ -21,6 +21,9 @@ struct ContentView: View {
         .foregroundStyle(.white)
         .preferredColorScheme(.dark)
         .frame(minWidth: 980, minHeight: 620)
+        .sheet(isPresented: Binding(get: { model.calPhase != .idle }, set: { if !$0 { model.closeCalibration() } })) {
+            CalibrationSheet().environmentObject(model)
+        }
     }
 
     // MARK: Header
@@ -109,20 +112,33 @@ struct ContentView: View {
     private var outputsColumn: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                sectionTitle("OUTPUTS", "기기별 지연 0–1000 ms")
-                Button { model.autoAlign() } label: {
+                sectionTitle("OUTPUTS", "가장 늦은 기기에 자동 정렬")
+                Button { model.allAuto() } label: {
                     HStack(spacing: 5) {
-                        Symbol("wand.and.stars", size: 11)
-                        Text("자동 맞춤")
+                        Symbol("arrow.counterclockwise", size: 11)
+                        Text("모두 자동")
                     }
                     .font(.system(size: 11, weight: .semibold))
                     .padding(.horizontal, 10).frame(height: 24)
                         .background(Capsule().fill(Color.white.opacity(0.09)))
                 }
                 .buttonStyle(.plain)
-                .disabled(!model.canAutoAlign)
-                .opacity(model.canAutoAlign ? 1 : 0.35)
-                .help("각 장치가 보고하는 하드웨어 지연을 기준으로, 가장 느린 장치에 맞춰 나머지를 늦춥니다 (블루투스는 실제와 다를 수 있음)")
+                .disabled(!model.canAllAuto)
+                .opacity(model.canAllAuto ? 1 : 0.35)
+                .help("모든 기기를 장치가 보고하는 하드웨어 지연으로 되돌립니다")
+                Button { model.openCalibration() } label: {
+                    HStack(spacing: 5) {
+                        Symbol("waveform.badge.magnifyingglass", size: 11)
+                        Text("룸 캘리브레이션")
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 10).frame(height: 24)
+                    .background(Capsule().fill(Theme.accent.opacity(0.85)))
+                }
+                .buttonStyle(.plain)
+                .disabled(!model.canCalibrate)
+                .opacity(model.canCalibrate ? 1 : 0.35)
+                .help("마이크로 방의 울림을 측정해 기기별 지연을 자동으로 계산합니다 (출력 2개 이상 + 마이크 필요)")
             }
             ScrollView {
                 VStack(spacing: 12) {
@@ -196,7 +212,21 @@ struct SourceCard: View {
                 VStack(alignment: .leading, spacing: 6) {
                     step("1", "제어 센터 ▸ 소리 에서 AdvancedMIO 선택")
                     step("2", "오른쪽에서 소리를 내보낼 장치를 켜고 지연 조절")
-                    step("3", "마이크 표시는 소리가 재생되는 동안에만 나타납니다")
+                    if model.driverOutdated {
+                        Text("설치된 드라이버가 오래되어 시스템 음량 조절이 안 되고 마이크 표시가 뜹니다. 업데이트하세요.")
+                            .font(.system(size: 11.5)).foregroundStyle(Theme.pink).fixedSize(horizontal: false, vertical: true)
+                        Button { model.installDriver() } label: {
+                            HStack(spacing: 8) {
+                                if model.installing { ProgressView().controlSize(.small).tint(.white) }
+                                else { Symbol("arrow.triangle.2.circlepath", size: 12) }
+                                Text(model.installing ? "업데이트 중…" : "드라이버 업데이트")
+                            }
+                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 16).frame(height: 32)
+                            .background(Capsule().fill(Theme.accent))
+                        }
+                        .buttonStyle(.plain).disabled(model.installing)
+                    }
                 }
             } else {
                 Text("제어 센터에 나타나는 출력 장치 'AdvancedMIO'를 만들려면 가상 오디오 드라이버를 한 번 설치해야 합니다. 관리자 암호를 물어봅니다.")
@@ -231,6 +261,17 @@ struct OutputCard: View {
     @EnvironmentObject var model: AppModel
     let device: AudioDeviceInfo
 
+    @ViewBuilder private var appliedLabel: some View {
+        if model.isReference(device.uid) {
+            Text("기준 · 가장 늦은 기기").foregroundStyle(Theme.cyan)
+                .font(.system(size: 11, weight: .medium))
+        } else {
+            let ms = model.appliedDelayMs(device.uid)
+            Text(ms < 0.5 ? "지연 없음" : "기준에 맞춰 \(Int(ms.rounded())) ms 늦춤")
+                .font(.system(size: 11)).foregroundStyle(Theme.text2)
+        }
+    }
+
     var body: some View {
         let cfg = model.config(device.uid)
         let on = cfg.enabled
@@ -246,24 +287,26 @@ struct OutputCard: View {
                         }
                     }
                     .font(.system(size: 11)).foregroundStyle(Theme.text3)
+                    if on { appliedLabel }
                 }
                 Spacer()
                 Toggle("", isOn: Binding(get: { on }, set: { model.setEnabled(device.uid, $0) }))
                     .toggleStyle(.switch).labelsHidden().tint(Theme.violet)
             }
 
-            DelayScrubber(value: cfg.delayMs, onChange: { model.setDelay(device.uid, $0) }, enabled: on,
+            DelayScrubber(value: model.totalLag(device.uid), onChange: { model.setTotalLag(device.uid, $0) }, enabled: on,
+                          autoOn: cfg.auto, onAuto: { model.setAuto(device.uid, $0) },
                           forceBubble: CommandLine.arguments.contains("--demo-drag") && device.uid == "AirPods Pro")
 
             HStack(spacing: 10) {
-                Symbol(cfg.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill", size: 11, weight: .regular)
+                Symbol(model.deviceVolume(device.uid) == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill", size: 11, weight: .regular)
                     .foregroundStyle(Theme.text3).frame(width: 16)
-                Slider(value: Binding(get: { cfg.volume }, set: { model.setVolume(device.uid, $0) }), in: 0...1)
+                Slider(value: Binding(get: { model.deviceVolume(device.uid) }, set: { model.setDeviceVolume(device.uid, $0) }), in: 0...AppModel.maxVolume)
                     .tint(Theme.violet).controlSize(.small)
                     .frame(width: 140)
-                Text("\(Int((cfg.volume * 100).rounded()))%")
+                Text("\(Int((model.deviceVolume(device.uid) * 100).rounded()))%")
                     .font(.system(size: 11, weight: .medium)).monospacedDigit().foregroundStyle(Theme.text3)
-                    .frame(width: 34, alignment: .trailing)
+                    .frame(width: 40, alignment: .trailing)
                 if on && model.capturing { LevelMeter(source: { model.outputLevel(device.uid) }, height: 4) }
                 else { Capsule().fill(Color.white.opacity(0.06)).frame(height: 4) }
             }

@@ -16,6 +16,8 @@ ICONSET="$(mktemp -d)/AppIcon.iconset"
 swift scripts/make_icon.swift "$ICONSET"
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
+[ -f sounds/TestSound.mp3 ] && cp sounds/TestSound.mp3 "$APP/Contents/Resources/TestSound.mp3"
+
 # Virtual audio device (AudioServerPlugIn). Installed into /Library/Audio/Plug-Ins/HAL by the app or scripts/install-driver.sh.
 DRV="$APP/Contents/Resources/AdvancedMIO.driver"
 mkdir -p "$DRV/Contents/MacOS"

@@ -93,14 +93,28 @@ private final class OutputState {
     }
 }
 
+/// Anything that continuously fills a `StereoRing` from a background thread (shared-memory driver feed, test probe).
+protocol RingSource: AnyObject {
+    var ring: StereoRing { get }
+    var level: Float { get }
+    func startFeeding()
+    func stopFeeding()
+}
+
 /// Owns every IOProc. Create → `start()` → `stop()` (also on deinit).
 final class RouterEngine {
     private struct In { let device: AudioDeviceInfo; let io: DeviceIO; let state: InputState }
     private struct Out { let device: AudioDeviceInfo; let io: DeviceIO; let state: OutputState }
     private var ins: [In] = []
     private var outs: [Out] = []
+    /// Alternative to capturing an input device: audio arrives through the driver's shared memory (no mic indicator).
+    private var shared: RingSource?
+    /// Outputs that could not be set up or started. They are skipped so one bad device cannot silence the others.
+    private(set) var failures: [(name: String, message: String)] = []
 
-    init(inputs: [AudioDeviceInfo], outputs: [(AudioDeviceInfo, OutputConfig)]) throws {
+    init(inputs: [AudioDeviceInfo], shared: RingSource? = nil,
+         outputs: [(device: AudioDeviceInfo, delayMs: Double, volume: Double)]) throws {
+        self.shared = shared
         do {
             for d in inputs {
                 let rate = try HAL.validateFloatIO(d.id, scope: kAudioObjectPropertyScopeInput)
@@ -111,16 +125,20 @@ final class RouterEngine {
                 }
                 ins.append(In(device: d, io: try DeviceIO(deviceID: d.id, block: block), state: state))
             }
-            for (d, cfg) in outputs {
+            for (d, delayMs, volume) in outputs {
+                do {
                 let rate = try HAL.validateFloatIO(d.id, scope: kAudioObjectPropertyScopeOutput)
-                let readers = ins.map { DelayReader(ring: $0.state.ring, outputSampleRate: rate, delayMs: cfg.delayMs) }
-                readers.forEach { $0.setGain(Float(cfg.volume)) }
+                let rings = ins.map { $0.state.ring } + (shared.map { [$0.ring] } ?? [])
+                let readers = rings.map { DelayReader(ring: $0, outputSampleRate: rate, delayMs: delayMs) }
+                readers.forEach { $0.setGain(Float(volume)) }
                 let state = OutputState(readers: readers)
                 let block: AudioDeviceIOBlock = { _, _, _, outData, _ in
                     state.process(UnsafeMutableAudioBufferListPointer(outData))
                 }
                 outs.append(Out(device: d, io: try DeviceIO(deviceID: d.id, block: block), state: state))
+                } catch { failures.append((d.name, error.localizedDescription)) }
             }
+            if outs.isEmpty, !outputs.isEmpty { throw IOError(message: failures.map { "\($0.name): \($0.message)" }.joined(separator: " · ")) }
         } catch {
             stop()
             throw error
@@ -129,8 +147,16 @@ final class RouterEngine {
 
     func start() throws {
         do {
+            shared?.startFeeding()
             for i in ins { try i.io.start() }       // capture first so rings fill before playback begins
-            for o in outs { try o.io.start() }
+            for o in outs {
+                do { try o.io.start() } catch {
+                    o.io.stop()
+                    failures.append((o.device.name, error.localizedDescription))
+                    outs.removeAll { $0.device.uid == o.device.uid }
+                }
+            }
+            if outs.isEmpty { throw IOError(message: failures.map { "\($0.name): \($0.message)" }.joined(separator: " · ")) }
         } catch {
             stop()
             throw error
@@ -140,6 +166,7 @@ final class RouterEngine {
     func stop() {
         outs.forEach { $0.io.stop() }
         ins.forEach { $0.io.stop() }
+        shared?.stopFeeding(); shared = nil
         outs.removeAll(); ins.removeAll()
     }
 
@@ -165,7 +192,7 @@ final class RouterEngine {
 
     func setDelay(uid: String, ms: Double) { outs.first { $0.device.uid == uid }?.state.setDelay(ms: ms) }
     func setGain(uid: String, _ g: Float) { outs.first { $0.device.uid == uid }?.state.setGain(g) }
-    func inputLevel(uid: String) -> Float { ins.first { $0.device.uid == uid }?.state.level ?? 0 }
+    func inputLevel(uid: String) -> Float { ins.first { $0.device.uid == uid }?.state.level ?? shared?.level ?? 0 }
     func outputLevel(uid: String) -> Float { outs.first { $0.device.uid == uid }?.state.level ?? 0 }
 
     deinit { stop() }

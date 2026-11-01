@@ -8,7 +8,12 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <fcntl.h>
 #include <math.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <string.h>
 
 #define kDeviceUID   "AdvancedMIO_Device"
@@ -40,12 +45,39 @@ static UInt64 gAnchorHostTime = 0;
 static Float64 gHostTicksPerFrame = 0;
 static Float32 gRing[kRingFrames * kChannels];
 static SInt64 gWrittenEnd = 0;      // sample time just past the newest frame written
-static Float32 gVolume = 1.0f;      // master scalar 0…1 (system volume)
+static Float32 gVolume = 1.0f;      // master scalar 0…1 (system volume); 1.0 = unity (0 dB), no boost
 static UInt32 gMute = 0;
 static Float32 gAppliedGain = 1.0f; // IO thread only: gain at the end of the previous cycle (for click-free ramps)
 static UInt32 gPlayClients = 0;
 static UInt32 gOurClients[8];       // client IDs of the AdvancedMIO app (excluded from gPlayClients)
 static UInt32 gOurCount = 0;
+
+// Shared-memory copy of the loopback ring. The app reads it directly instead of opening the device's input stream,
+// so macOS never shows the orange microphone indicator. (The input stream stays as a fallback.)
+#define kShmName   "/AdvancedMIO.ring"
+#define kShmMagic  0x414D494Fu      // 'AMIO'
+typedef struct {
+    uint32_t magic, version, sampleRate, ringFrames;
+    volatile int64_t writeEnd;      // sample time just past the newest frame
+    Float32 data[kRingFrames * kChannels];
+} SharedRing;
+static SharedRing *gShared = NULL;
+
+static void OpenSharedRing(void) {
+    int fd = shm_open(kShmName, O_CREAT | O_RDWR, 0666);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size == 0) ftruncate(fd, sizeof(SharedRing));
+    fchmod(fd, 0666);                // the app runs as the logged-in user, the driver as _coreaudiod
+    void *m = mmap(NULL, sizeof(SharedRing), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return;
+    SharedRing *r = m;
+    r->version = 1; r->sampleRate = (uint32_t)kSampleRate; r->ringFrames = kRingFrames;
+    __atomic_store_n(&r->writeEnd, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&r->magic, kShmMagic, __ATOMIC_RELEASE);
+    gShared = r;
+}
 
 // MARK: - Helpers
 
@@ -65,7 +97,8 @@ static AudioStreamBasicDescription StreamFormat(void) {
 static bool IsStream(AudioObjectID o) { return o == kObj_StreamInput || o == kObj_StreamOutput; }
 static bool IsControl(AudioObjectID o) { return o == kObj_Volume || o == kObj_Mute; }
 
-static Float32 ScalarToDb(Float32 s) { return kDbMin + (0.0f - kDbMin) * s; }
+// Linear in dB from -64 dB (0) to 0 dB (1): system volume 100 is unity, the device is never boosted digitally.
+static Float32 ScalarToDb(Float32 s) { s = s < 0 ? 0 : (s > 1 ? 1 : s); return kDbMin + (0.0f - kDbMin) * s; }
 static Float32 DbToScalar(Float32 db) { Float32 s = (db - kDbMin) / (0.0f - kDbMin); return s < 0 ? 0 : (s > 1 ? 1 : s); }
 static Float32 ScalarToGain(Float32 s) { return s <= 0 ? 0 : powf(10.0f, ScalarToDb(s) / 20.0f); }
 
@@ -257,6 +290,7 @@ static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRe
     struct mach_timebase_info tb; mach_timebase_info(&tb);
     Float64 ticksPerSecond = 1e9 * (Float64)tb.denom / (Float64)tb.numer;
     gHostTicksPerFrame = ticksPerSecond / kSampleRate;
+    OpenSharedRing();
     return kAudioHardwareNoError;
 }
 
@@ -346,6 +380,7 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 cl
         gAnchorHostTime = mach_absolute_time();
         memset(gRing, 0, sizeof gRing);
         gWrittenEnd = 0;
+        if (gShared) { memset(gShared->data, 0, sizeof gShared->data); __atomic_store_n(&gShared->writeEnd, 0, __ATOMIC_RELEASE); }
     }
     gIOCount++;
     if (!IsOurClient(client)) gPlayClients++;
@@ -393,10 +428,12 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID o, Aud
             UInt32 slot = (UInt32)((t + i) & (kRingFrames - 1)) * kChannels;
             gRing[slot] = buf[i * kChannels] * g;
             gRing[slot + 1] = buf[i * kChannels + 1] * g;
+            if (gShared) { gShared->data[slot] = gRing[slot]; gShared->data[slot + 1] = gRing[slot + 1]; }
         }
         gAppliedGain = target;
         SInt64 end = t + frames;
         if (end > __atomic_load_n(&gWrittenEnd, __ATOMIC_RELAXED)) __atomic_store_n(&gWrittenEnd, end, __ATOMIC_RELAXED);
+        if (gShared && end > gShared->writeEnd) __atomic_store_n(&gShared->writeEnd, end, __ATOMIC_RELEASE);
     } else if (op == kAudioServerPlugInIOOperationReadInput) {
         SInt64 t = (SInt64)cycle->mInputTime.mSampleTime;
         SInt64 end = __atomic_load_n(&gWrittenEnd, __ATOMIC_RELAXED);

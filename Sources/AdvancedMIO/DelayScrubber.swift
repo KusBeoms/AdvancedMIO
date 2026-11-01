@@ -2,7 +2,7 @@ import AppKit
 import MIOCore
 import SwiftUI
 
-/// Figma-style delay control, 0–1000 ms.
+/// Figma-style lag-correction control, 0–1000 ms: how late this device sounds (starts at its reported hardware latency).
 ///  • Drag the ruler → the playhead follows the pointer (1 ms steps).
 ///  • Drag the number → relative scrub, like Figma's numeric fields (⇧ ×10, ⌥ ×¼).
 ///  • Double-click the number → reset to 0.
@@ -11,6 +11,8 @@ struct DelayScrubber: View {
     let value: Double
     let onChange: (Double) -> Void
     var enabled = true
+    var autoOn = false
+    var onAuto: ((Bool) -> Void)?
     var forceBubble = false          // screenshots only
 
     private let maxValue = DelayReader.maxDelayMs
@@ -27,7 +29,7 @@ struct DelayScrubber: View {
         .opacity(enabled ? 1 : 0.4)
         .allowsHitTesting(enabled)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("출력 지연")
+        .accessibilityLabel("기기 지연")
         .accessibilityValue("\(Int(value)) 밀리초")
         .accessibilityAdjustableAction { dir in
             switch dir {
@@ -42,16 +44,22 @@ struct DelayScrubber: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Text("SYNC DELAY")
+            Text("DEVICE LAG")
                 .font(.system(size: 10, weight: .semibold)).tracking(1.2)
                 .foregroundStyle(Theme.text3)
+            if let onAuto {
+                Toggle("자동 정렬", isOn: Binding(get: { autoOn }, set: onAuto))
+                    .toggleStyle(.switch).controlSize(.mini).tint(Theme.violet)
+                    .font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.text2)
+                    .help("켜면 장치가 보고하는 하드웨어 지연을 따라갑니다. 슬라이더를 움직이면 꺼집니다")
+            }
             Spacer()
             roundButton("minus") { apply(value - (NSEvent.modifierFlags.contains(.shift) ? 10 : 1)) }
             numberField
             roundButton("plus") { apply(value + (NSEvent.modifierFlags.contains(.shift) ? 10 : 1)) }
-            roundButton("arrow.counterclockwise") { apply(0) }
-                .opacity(value == 0 ? 0.25 : 1)
-                .help("0 ms로 리셋")
+            roundButton("arrow.counterclockwise") { if let onAuto { onAuto(true) } else { apply(0) } }
+                .opacity(onAuto != nil ? (autoOn ? 0.25 : 1) : (value == 0 ? 0.25 : 1))
+                .help(onAuto != nil ? "자동(하드웨어 지연)으로 되돌리기" : "0 ms로 리셋")
         }
     }
 

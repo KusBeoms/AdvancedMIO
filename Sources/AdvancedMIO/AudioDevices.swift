@@ -64,6 +64,44 @@ struct IOError: LocalizedError {
 }
 
 enum HAL {
+    // kAudioHardwareServiceDeviceProperty_VirtualMainVolume ('vmvc'): the device's own master volume, the same one the
+    // Sound settings slider and the volume keys drive.
+    private static let virtualMainVolume: AudioObjectPropertySelector = 0x766D_7663
+
+    private static func volumeAddress(_ sel: AudioObjectPropertySelector, element: UInt32) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeOutput, mElement: element)
+    }
+
+    /// The output device's own hardware volume (0…1), or nil when it exposes none.
+    static func hardwareVolume(_ id: AudioObjectID) -> Float? {
+        for (sel, el) in [(virtualMainVolume, kAudioObjectPropertyElementMain), (kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyElementMain),
+                          (kAudioDevicePropertyVolumeScalar, 1)] {
+            var a = volumeAddress(sel, element: el)
+            guard AudioObjectHasProperty(id, &a) else { continue }
+            var v: Float32 = 0, size = UInt32(MemoryLayout<Float32>.size)
+            if AudioObjectGetPropertyData(id, &a, 0, nil, &size, &v) == noErr { return v }
+        }
+        return nil
+    }
+
+    /// Tells the real device to play at `volume` (0…1). False if the device does not accept it.
+    @discardableResult
+    static func setHardwareVolume(_ id: AudioObjectID, _ volume: Float) -> Bool {
+        var v = min(1, max(0, volume))
+        func set(_ sel: AudioObjectPropertySelector, _ el: UInt32) -> Bool {
+            var a = volumeAddress(sel, element: el)
+            var settable: DarwinBoolean = false
+            guard AudioObjectHasProperty(id, &a), AudioObjectIsPropertySettable(id, &a, &settable) == noErr, settable.boolValue else { return false }
+            return AudioObjectSetPropertyData(id, &a, 0, nil, UInt32(MemoryLayout<Float32>.size), &v) == noErr
+        }
+        if set(virtualMainVolume, kAudioObjectPropertyElementMain) { return true }
+        if set(kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyElementMain) { return true }
+        let channels = channelCount(id, scope: kAudioObjectPropertyScopeOutput)
+        var any = false
+        for c in 1...max(1, channels) where set(kAudioDevicePropertyVolumeScalar, UInt32(c)) { any = true }
+        return any
+    }
+
     /// Number of other processes currently playing to the AdvancedMIO virtual device (driver-defined property 'amip').
     /// nil when the installed driver predates the property.
     static func playbackClients(_ id: AudioDeviceID) -> UInt32? {
