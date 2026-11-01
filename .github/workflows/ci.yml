@@ -11,6 +11,8 @@ jobs:
       - run: swift test
   macos:
     runs-on: macos-14
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
@@ -18,3 +20,25 @@ jobs:
       - run: swift test
       - run: scripts/bundle.sh
       - run: codesign --verify --verbose build/AdvancedMIO.app
+      - name: Screenshot (demo mode)
+        continue-on-error: true
+        run: |
+          mkdir -p shots
+          open build/AdvancedMIO.app --args --demo
+          sleep 8
+          screencapture -x shots/demo.png || true
+          system_profiler SPDisplaysDataType | head -20 || true
+          ls -la shots
+          pkill AdvancedMIO || true
+      - name: Publish screenshot
+        if: github.ref_name != 'ci-screenshots'
+        continue-on-error: true
+        run: |
+          [ -s shots/demo.png ] || exit 0
+          cp -r shots /tmp/shots
+          git config user.name "ci"; git config user.email "ci@users.noreply.github.com"
+          git checkout --orphan ci-screenshots
+          git rm -rf --quiet .
+          cp /tmp/shots/*.png .
+          git add -A && git commit -qm "screenshots for ${GITHUB_SHA}"
+          git push -f origin ci-screenshots

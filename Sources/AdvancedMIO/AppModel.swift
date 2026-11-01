@@ -29,7 +29,10 @@ final class AppModel: ObservableObject {
     var inputDevices: [AudioDeviceInfo] { devices.filter(\.isInput) }
     var outputDevices: [AudioDeviceInfo] { devices.filter(\.isOutput) }
 
+    private var demo = false
+
     init() {
+        if CommandLine.arguments.contains("--demo") { loadDemo(); return }
         if let d = UserDefaults.standard.data(forKey: "state.v1"),
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
             selectedInputs = s.inputs
@@ -160,13 +163,52 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func inputLevel(_ uid: String) -> Float { engine?.inputLevel(uid: uid) ?? 0 }
-    func outputLevel(_ uid: String) -> Float { engine?.outputLevel(uid: uid) ?? 0 }
+    func inputLevel(_ uid: String) -> Float {
+        demo ? demoLevel(uid) : (engine?.inputLevel(uid: uid) ?? 0)
+    }
+    func outputLevel(_ uid: String) -> Float {
+        demo ? demoLevel(uid) : (engine?.outputLevel(uid: uid) ?? 0)
+    }
+
+    // MARK: Demo (used for screenshots: `AdvancedMIO --demo`)
+
+    private func demoLevel(_ uid: String) -> Float {
+        let t = Date.timeIntervalSinceReferenceDate
+        let seed = Double(abs(uid.hashValue % 97))
+        return Float(0.12 + 0.3 * abs(sin(t * 3 + seed)) * abs(sin(t * 1.3 + seed * 0.5)))
+    }
+
+    private func loadDemo() {
+        demo = true
+        func dev(_ id: UInt32, _ name: String, _ i: Int, _ o: Int, _ t: DeviceTransport) -> AudioDeviceInfo {
+            AudioDeviceInfo(id: id, uid: name, name: name, inputChannels: i, outputChannels: o, transport: t)
+        }
+        devices = [
+            dev(1, "BlackHole 2ch", 2, 2, .virtual),
+            dev(2, "MacBook Pro 마이크", 1, 0, .builtIn),
+            dev(3, "Scarlett 2i2 USB", 2, 2, .usb),
+            dev(4, "MacBook Pro 스피커", 0, 2, .builtIn),
+            dev(5, "AirPods Pro", 1, 2, .bluetooth),
+            dev(6, "LG UltraFine", 0, 2, .hdmi),
+            dev(7, "Studio Display 스피커", 0, 2, .usb),
+        ]
+        selectedInputs = ["BlackHole 2ch"]
+        outputs = [
+            "MacBook Pro 스피커": OutputConfig(enabled: true, delayMs: 0, volume: 0.9),
+            "AirPods Pro": OutputConfig(enabled: true, delayMs: 180, volume: 0.7),
+            "LG UltraFine": OutputConfig(enabled: true, delayMs: 520, volume: 1),
+            "Studio Display 스피커": OutputConfig(enabled: false, delayMs: 0, volume: 1),
+        ]
+        hwLatencyMs = ["MacBook Pro 스피커": 14, "AirPods Pro": 192, "LG UltraFine": 38, "Studio Display 스피커": 21,
+                       "BlackHole 2ch": 5, "Scarlett 2i2 USB": 9]
+        running = true
+    }
 
     // MARK: Persistence
 
     private struct Saved: Codable { var inputs: Set<String>; var outputs: [String: OutputConfig] }
     private func scheduleSave() {
+        guard !demo else { return }
         saveTask?.cancel()
         saveTask = Task { [selectedInputs, outputs] in
             try? await Task.sleep(nanoseconds: 400_000_000)
