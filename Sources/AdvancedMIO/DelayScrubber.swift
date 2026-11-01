@@ -12,7 +12,7 @@ struct DelayScrubber: View {
     let onChange: (Double) -> Void
     var enabled = true
 
-    private let maxValue = AppModel.maxDelayMs
+    private let maxValue = DelayReader.maxDelayMs
     @State private var dragging = false
     @State private var scrubStart: Double?
     @State private var hoverNumber = false
@@ -57,7 +57,6 @@ struct DelayScrubber: View {
         HStack(alignment: .firstTextBaseline, spacing: 3) {
             Text("\(Int(value))")
                 .font(.system(size: 20, weight: .semibold, design: .rounded)).monospacedDigit()
-                .contentTransition(.numericText(value: value))
             Text("ms").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.text2)
         }
         .frame(width: 88, height: 30)

@@ -12,7 +12,7 @@ struct OutputConfig: Codable, Equatable {
 
 @MainActor
 final class AppModel: ObservableObject {
-    static let maxDelayMs = DelayReader.maxDelayMs
+    nonisolated static let maxDelayMs = DelayReader.maxDelayMs
 
     @Published private(set) var devices: [AudioDeviceInfo] = []
     @Published private(set) var selectedInputs: Set<String> = []
