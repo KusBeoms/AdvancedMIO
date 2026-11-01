@@ -24,10 +24,14 @@ enum Probe {
             Thread.sleep(forTimeInterval: 2)
             engine.setDelay(uid: output.uid, ms: 1000)
             Thread.sleep(forTimeInterval: 1)
+            engine.diagnostics().forEach { print("  " + $0) }
+            let healthy = engine.isHealthy
             engine.stop()
-            print("loopback: ran \(input.name) → \(output.name) with delay changes, no errors")
+            print("loopback: \(input.name) → \(output.name), delay 250→1000 ms: \(healthy ? "OK (callbacks fired, audio moved)" : "FAILED (no callbacks)")")
+            if !healthy { exit(1) }
         } catch {
             print("loopback: FAILED \(error.localizedDescription)")
+            exit(1)
         }
     }
 }

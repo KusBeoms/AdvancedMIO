@@ -19,6 +19,7 @@ private final class InputState {
     let r = UnsafeMutablePointer<Float>.allocate(capacity: maxFrames)
     let refs = UnsafeMutablePointer<BufferRef>.allocate(capacity: maxBuffers)
     var level: Float = 0
+    var callbacks = 0, framesCaptured = 0
 
     init(rate: Double) {
         ring = StereoRing(sampleRate: rate)
@@ -37,7 +38,9 @@ private final class InputState {
             if frames == 0, b.mData != nil { frames = Int(b.mDataByteSize) / (MemoryLayout<Float>.size * ch) }
         }
         frames = min(frames, maxFrames)
+        callbacks += 1
         guard frames > 0 else { level = 0; return }
+        framesCaptured += frames
         ChannelMapping.extractStereo(UnsafeBufferPointer(start: refs, count: count), frames: frames, left: l, right: r)
         var peak: Float = 0
         for i in 0..<frames { peak = max(peak, abs(l[i]), abs(r[i])) }
@@ -53,6 +56,7 @@ private final class OutputState {
     let r = UnsafeMutablePointer<Float>.allocate(capacity: maxFrames)
     let refs = UnsafeMutablePointer<BufferRef>.allocate(capacity: maxBuffers)
     var level: Float = 0
+    var callbacks = 0, framesRendered = 0
 
     init(readers: [DelayReader]) {
         self.readers = readers
@@ -74,7 +78,9 @@ private final class OutputState {
             if frames == 0, b.mData != nil { frames = Int(b.mDataByteSize) / (MemoryLayout<Float>.size * ch) }
         }
         frames = min(frames, maxFrames)
+        callbacks += 1
         guard frames > 0 else { level = 0; return }
+        framesRendered += frames
         for i in 0..<frames { l[i] = 0; r[i] = 0 }
         for rd in readers { rd.render(into: l, r, frames: frames) }
         var peak: Float = 0
@@ -135,6 +141,21 @@ final class RouterEngine {
         outs.forEach { $0.io.stop() }
         ins.forEach { $0.io.stop() }
         outs.removeAll(); ins.removeAll()
+    }
+
+    /// Human-readable counters for `--probe` / bug reports.
+    func diagnostics() -> [String] {
+        ins.map { "input  \($0.device.name): \($0.state.callbacks) callbacks, \($0.state.framesCaptured) frames @ \(Int($0.state.ring.sampleRate)) Hz" }
+        + outs.map { o in
+            let lag = o.state.readers.first.map { String(format: "%.1f ms lag", $0.lagFrames / $0.ring.sampleRate * 1000) } ?? "-"
+            return "output \(o.device.name): \(o.state.callbacks) callbacks, \(o.state.framesRendered) frames, \(lag)"
+        }
+    }
+
+    /// True when every IOProc has been called and moved audio.
+    var isHealthy: Bool {
+        ins.allSatisfy { $0.state.callbacks > 0 && $0.state.framesCaptured > 0 }
+            && outs.allSatisfy { $0.state.callbacks > 0 && $0.state.framesRendered > 0 }
     }
 
     func setDelay(uid: String, ms: Double) { outs.first { $0.device.uid == uid }?.state.setDelay(ms: ms) }
