@@ -1,4 +1,25 @@
+import AppKit
 import SwiftUI
+
+/// SF Symbol drawn through NSImage (template-tinted by `foregroundStyle`). Falls back to `Image(systemName:)`.
+struct Symbol: View {
+    let name: String
+    var size: CGFloat = 14
+    var weight: NSFont.Weight = .semibold
+
+    init(_ name: String, size: CGFloat = 14, weight: NSFont.Weight = .semibold) {
+        self.name = name; self.size = size; self.weight = weight
+    }
+
+    var body: some View {
+        if let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: size, weight: weight)) {
+            Image(nsImage: img).renderingMode(.template)
+        } else {
+            Image(systemName: name).font(.system(size: size, weight: .semibold))
+        }
+    }
+}
 
 extension Color {
     init(hex: UInt32, opacity: Double = 1) {
@@ -53,8 +74,7 @@ struct IconBadge: View {
         ZStack {
             RoundedRectangle(cornerRadius: 11, style: .continuous)
                 .fill(active ? AnyShapeStyle(Theme.accentDiagonal) : AnyShapeStyle(Color.white.opacity(0.08)))
-            Image(systemName: symbol)
-                .font(.system(size: 16, weight: .semibold))
+            Symbol(symbol, size: 16)
                 .foregroundStyle(active ? .white : Theme.text2)
         }
         .frame(width: 38, height: 38)

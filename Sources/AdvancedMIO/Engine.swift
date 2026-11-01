@@ -5,6 +5,13 @@ import MIOCore
 private let maxFrames = 16384
 private let maxBuffers = 64
 
+/// Zeroes every buffer of an output list (an IOProc must not leave unused output uninitialised).
+private func silence(_ list: UnsafeMutablePointer<AudioBufferList>) {
+    for b in UnsafeMutableAudioBufferListPointer(list) {
+        if let d = b.mData { memset(d, 0, Int(b.mDataByteSize)) }
+    }
+}
+
 /// State shared with one input IOProc (audio thread) — captures a device into a ring buffer.
 private final class InputState {
     let ring: StereoRing
@@ -92,8 +99,9 @@ final class RouterEngine {
             for d in inputs {
                 let rate = try HAL.validateFloatIO(d.id, scope: kAudioObjectPropertyScopeInput)
                 let state = InputState(rate: rate)
-                let block: AudioDeviceIOBlock = { _, inData, _, _, _ in
+                let block: AudioDeviceIOBlock = { _, inData, _, outData, _ in
                     state.process(UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData)))
+                    silence(outData)   // duplex devices (BlackHole, USB interfaces): we only capture, so emit silence
                 }
                 ins.append(In(device: d, io: try DeviceIO(deviceID: d.id, block: block), state: state))
             }

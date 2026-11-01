@@ -85,7 +85,7 @@ struct DelayScrubber: View {
 
     private func roundButton(_ symbol: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: symbol).font(.system(size: 10, weight: .bold))
+            Symbol(symbol, size: 10, weight: .bold)
                 .frame(width: 24, height: 24)
                 .background(Circle().fill(Color.white.opacity(0.07)))
         }

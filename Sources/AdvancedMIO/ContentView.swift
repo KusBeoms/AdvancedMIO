@@ -29,7 +29,7 @@ struct ContentView: View {
         HStack(spacing: 14) {
             ZStack {
                 RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Theme.accentDiagonal)
-                Image(systemName: "waveform.path").font(.system(size: 18, weight: .bold)).foregroundStyle(.white)
+                Symbol("waveform.path", size: 18, weight: .bold).foregroundStyle(.white)
             }
             .frame(width: 40, height: 40)
             .shadow(color: Theme.violet.opacity(0.5), radius: 10, y: 3)
@@ -41,7 +41,7 @@ struct ContentView: View {
             Spacer()
             StatusPill(running: model.running)
             Button { model.refresh() } label: {
-                Image(systemName: "arrow.clockwise").font(.system(size: 13, weight: .semibold))
+                Symbol("arrow.clockwise", size: 13)
                     .frame(width: 34, height: 34)
                     .background(Circle().fill(Color.white.opacity(0.08)))
             }
@@ -57,7 +57,7 @@ struct ContentView: View {
         Button { model.toggleRunning() } label: {
             HStack(spacing: 8) {
                 if model.busy { ProgressView().controlSize(.small).tint(.white) }
-                else { Image(systemName: model.running ? "stop.fill" : "play.fill") }
+                else { Symbol(model.running ? "stop.fill" : "play.fill", size: 12) }
                 Text(model.running ? "정지" : "시작")
             }
             .font(.system(size: 14, weight: .semibold))
@@ -74,10 +74,10 @@ struct ContentView: View {
 
     private func errorBanner(_ text: String) -> some View {
         HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.pink)
+            Symbol("exclamationmark.triangle.fill", size: 14).foregroundStyle(Theme.pink)
             Text(text).font(.system(size: 12.5)).foregroundStyle(.white.opacity(0.9))
             Spacer()
-            Button { model.error = nil } label: { Image(systemName: "xmark").font(.system(size: 10, weight: .bold)) }
+            Button { model.error = nil } label: { Symbol("xmark", size: 10, weight: .bold) }
                 .buttonStyle(.plain).foregroundStyle(Theme.text2)
         }
         .padding(12)
@@ -144,7 +144,7 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack(spacing: 8) {
-            Image(systemName: "info.circle").foregroundStyle(Theme.text3)
+            Symbol("info.circle", size: 12, weight: .regular).foregroundStyle(Theme.text3)
             Text("시스템 소리를 보내려면 ")
             + Text("BlackHole").foregroundColor(Theme.cyan)
             + Text(" 같은 가상 장치를 시스템 출력으로 지정하고, 여기서 그 장치를 입력으로 선택하세요.")
@@ -194,8 +194,7 @@ struct InputRow: View {
                     if selected && model.running { LevelMeter(source: { model.inputLevel(device.uid) }, height: 3) }
                 }
                 Spacer(minLength: 4)
-                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 18))
+                Symbol(selected ? "checkmark.circle.fill" : "circle", size: 18, weight: .regular)
                     .foregroundStyle(selected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Color.white.opacity(0.22)))
             }
             .padding(12)
@@ -241,8 +240,8 @@ struct OutputCard: View {
                           forceBubble: CommandLine.arguments.contains("--demo-drag") && device.uid == "AirPods Pro")
 
             HStack(spacing: 10) {
-                Image(systemName: cfg.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                    .font(.system(size: 11)).foregroundStyle(Theme.text3).frame(width: 16)
+                Symbol(cfg.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill", size: 11, weight: .regular)
+                    .foregroundStyle(Theme.text3).frame(width: 16)
                 Slider(value: Binding(get: { cfg.volume }, set: { model.setVolume(device.uid, $0) }), in: 0...1)
                     .tint(Theme.violet).controlSize(.small)
                     .frame(width: 140)
