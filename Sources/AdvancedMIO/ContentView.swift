@@ -18,6 +18,7 @@ struct ContentView: View {
                 footer
             }
         }
+        .foregroundStyle(.white)
         .preferredColorScheme(.dark)
         .frame(minWidth: 980, minHeight: 620)
     }
@@ -236,7 +237,8 @@ struct OutputCard: View {
                     .help(blocked ? "입력으로 선택된 장치는 출력으로 쓸 수 없습니다 (하울링 방지)" : "")
             }
 
-            DelayScrubber(value: cfg.delayMs, onChange: { model.setDelay(device.uid, $0) }, enabled: on)
+            DelayScrubber(value: cfg.delayMs, onChange: { model.setDelay(device.uid, $0) }, enabled: on,
+                          forceBubble: CommandLine.arguments.contains("--demo-drag") && device.uid == "AirPods Pro")
 
             HStack(spacing: 10) {
                 Image(systemName: cfg.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")

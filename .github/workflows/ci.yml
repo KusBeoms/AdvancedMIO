@@ -24,21 +24,30 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p shots
-          open build/AdvancedMIO.app --args --demo
-          sleep 8
-          screencapture -x shots/demo.png || true
-          system_profiler SPDisplaysDataType | head -20 || true
+          ls /System/Library/CoreServices/CoreGlyphs.bundle >/dev/null 2>&1 && echo "CoreGlyphs present" || echo "CoreGlyphs MISSING"
+          shoot() { # $1 = name, rest = app args
+            name=$1; shift
+            open -n build/AdvancedMIO.app --args "$@"
+            sleep 7
+            osascript -e 'tell application "AdvancedMIO" to activate' || true
+            sleep 3
+            screencapture -x "shots/$name-full.png" || true
+            sips --cropToHeightWidth 700 1040 --cropOffset 160 440 "shots/$name-full.png" --out "shots/$name.png" || true
+            pkill -x AdvancedMIO || true
+            sleep 2
+          }
+          shoot demo --demo
+          shoot drag --demo --demo-drag
           ls -la shots
-          pkill AdvancedMIO || true
       - name: Publish screenshot
         if: github.ref_name != 'ci-screenshots'
         continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           [ -s shots/demo.png ] || exit 0
-          cp -r shots /tmp/shots
-          git config user.name "ci"; git config user.email "ci@users.noreply.github.com"
-          git checkout --orphan ci-screenshots
-          git rm -rf --quiet .
-          cp /tmp/shots/*.png .
+          rm -rf /tmp/pub && mkdir /tmp/pub && cp shots/*.png /tmp/pub/ && cd /tmp/pub
+          git init -q && git checkout -q -b ci-screenshots
+          git config user.name ci && git config user.email ci@users.noreply.github.com
           git add -A && git commit -qm "screenshots for ${GITHUB_SHA}"
-          git push -f origin ci-screenshots
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-screenshots

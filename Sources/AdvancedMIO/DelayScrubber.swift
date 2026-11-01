@@ -11,9 +11,11 @@ struct DelayScrubber: View {
     let value: Double
     let onChange: (Double) -> Void
     var enabled = true
+    var forceBubble = false          // screenshots only
 
     private let maxValue = DelayReader.maxDelayMs
-    @State private var dragging = false
+    @State private var draggingState = false
+    private var dragging: Bool { draggingState || forceBubble }
     @State private var scrubStart: Double?
     @State private var hoverNumber = false
 
@@ -124,7 +126,7 @@ struct DelayScrubber: View {
                     let step = size.width < 360 ? 200 : 100
                     for ms in stride(from: 0, through: 1000, by: step) {
                         let tx = CGFloat(ms) / 1000 * size.width
-                        let t = Text("\(ms)").font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.35))
+                        let t = Text(String(ms)).font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.35))
                         let anchor: UnitPoint = ms == 0 ? .topLeading : (ms == 1000 ? .topTrailing : .top)
                         ctx.draw(t, at: CGPoint(x: tx, y: 0), anchor: anchor)
                     }
@@ -156,7 +158,7 @@ struct DelayScrubber: View {
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { g in
-                        if !dragging { withAnimation(.easeOut(duration: 0.12)) { dragging = true } }
+                        if !draggingState { withAnimation(.easeOut(duration: 0.12)) { draggingState = true } }
                         let f = NSEvent.modifierFlags
                         // ⌥ = fine mode: the pointer moves the playhead at ¼ speed from where the drag began.
                         if f.contains(.option), let s = fineAnchor {
@@ -168,7 +170,7 @@ struct DelayScrubber: View {
                     }
                     .onEnded { _ in
                         fineAnchor = nil
-                        withAnimation(.easeOut(duration: 0.2)) { dragging = false }
+                        withAnimation(.easeOut(duration: 0.2)) { draggingState = false }
                     }
             )
         }
