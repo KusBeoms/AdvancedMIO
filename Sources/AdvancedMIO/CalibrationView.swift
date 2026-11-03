@@ -21,7 +21,7 @@ struct CalibrationSheet: View {
         }
         .foregroundStyle(.white)
         .preferredColorScheme(.dark)
-        .frame(width: 560, height: 640)
+        .frame(width: 600, height: 740)
     }
 
     // MARK: Steps
@@ -79,7 +79,7 @@ struct CalibrationSheet: View {
 
     private var running: some View {
         VStack(alignment: .leading, spacing: 18) {
-            title("2 · 측정 중", "노래가 끊기지 않고 이어집니다. 먼저 한 기기씩 음량을 부드럽게 바꿔 스피커 위치를 파악하고, 계산(경사하강법 + 디지털 트윈)으로 가장 울림이 적은 지연을 구한 뒤, 노래가 계속 나오는 상태에서 적용하고 바로 측정하는 일을 반복합니다. 끝날 때까지 조용히 해 주세요.")
+            title("2 · 측정 중", "노래를 처음부터 끝까지 한 번 틀면서 녹음합니다. 그동안 기기를 하나씩 번갈아 음량을 부드럽게 키우고 줄여서 어느 소리가 어느 스피커인지 구별합니다 (음량이 조금씩 오르내리는 게 정상입니다). 노래가 끝나면 녹음 전체로 스피커별 도착 시간을 한 번에 계산합니다. 끝날 때까지 조용히 해 주세요.")
             Spacer()
             VStack(alignment: .leading, spacing: 10) {
                 ProgressView(value: model.calFraction).tint(Theme.cyan)
@@ -87,10 +87,6 @@ struct CalibrationSheet: View {
                 HStack(spacing: 14) {
                     Text(model.calRemaining.map { "남은 시간 약 \(Int($0.rounded()))초" } ?? "마무리 중…")
                         .font(.system(size: 12, weight: .semibold, design: .rounded).monospacedDigit())
-                    if let g = model.calBestSoFar {
-                        Text(g < 0.01 ? "지금까지: 아직 개선 없음" : "지금까지 최선: 울림 −\(Int((g * 100).rounded()))%")
-                            .font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.cyan)
-                    }
                 }
             }
             .padding(18).card()
@@ -98,10 +94,6 @@ struct CalibrationSheet: View {
             HStack {
                 button("중단", primary: false) { model.closeCalibration() }
                 Spacer()
-                button(model.calFinishRequested ? "마무리 중…" : "지금까지 최선으로 마치기", primary: true) { model.finishCalibrationEarly() }
-                    .disabled(!model.calCanFinishEarly || model.calFinishRequested)
-                    .opacity(model.calCanFinishEarly && !model.calFinishRequested ? 1 : 0.4)
-                    .help("측정 시작 단계가 끝나면 누를 수 있습니다. 지금까지 가장 좋았던 설정으로 결과를 만듭니다.")
             }
         }
     }
@@ -109,54 +101,13 @@ struct CalibrationSheet: View {
     private var done: some View {
         let r = model.calReport
         return VStack(alignment: .leading, spacing: 14) {
-            title("3 · 결과", "모든 스피커를 함께 틀어 실제로 측정해 가며 찾은, 울림이 가장 적은 설정입니다. 적용하면 기기별 지연이 이 값으로 바뀝니다 (음량은 그대로).")
-            if let r {
-                let o = r.outcome
-                VStack(alignment: .leading, spacing: 10) {
-                    if let mb = r.measuredBefore, let ma = r.measuredAfter, let imp = r.measuredImprovement {
-                        Text(imp < 0.02 ? "측정 결과 개선이 확인되지 않았습니다" : "울림 지수 \(fmt(mb)) → \(fmt(ma))  (−\(Int((imp * 100).rounded()))%)")
-                            .font(.system(size: 15, weight: .bold, design: .rounded))
-                    } else {
-                        Text("원래 설정을 측정하지 못해 비교할 수 없습니다").font(.system(size: 15, weight: .bold, design: .rounded))
-                    }
-                    Text("마이크 \(r.micsUsed.joined(separator: ", ")) 기준 · 낮을수록 울림이 적음 · \(r.evaluations)번 측정으로 확인")
-                        .font(.system(size: 11)).foregroundStyle(Theme.text3)
-                    Divider().overlay(Color.white.opacity(0.1))
-                    ForEach(Array(r.speakerNames.enumerated()), id: \.offset) { i, name in
-                        HStack {
-                            Text(name).font(.system(size: 13)).lineLimit(1)
-                            Spacer()
-                            if r.excluded.contains(name) {
-                                Text("제외 (소리 안 잡힘)").font(.system(size: 12)).foregroundStyle(Theme.text3)
-                            } else {
-                                Text("지연 +\(fmt(o.delaysMs[i])) ms").font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit())
-                                    .foregroundStyle(Theme.cyan)
-                            }
-                        }
-                    }
+            title("3 · 결과", "스피커별 도착 시간을 재서, 모든 소리가 마이크 위치에 같은 순간 닿도록 계산한 지연입니다. 적용하면 기기별 지연이 이 값으로 바뀝니다 (음량은 그대로).")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if let r { resultBody(r) }
                 }
-                .padding(16).card(highlighted: true)
-                VStack(alignment: .leading, spacing: 4) {
-                    if r.searchHistory.count > 1 {
-                        Text("측정 경과 (최고값): " + r.searchHistory.map { fmt($0) }.joined(separator: " → "))
-                            .font(.system(size: 11)).foregroundStyle(Theme.text3).fixedSize(horizontal: false, vertical: true)
-                    }
-                    if !r.reliable {
-                        Text("⚠︎ 개선 폭이 5% 미만이라 신뢰하기 어려운 결과입니다 (측정 오차 범위).")
-                            .font(.system(size: 12.5, weight: .semibold)).foregroundStyle(Theme.pink)
-                    }
-                    if !r.finished {
-                        Text("시간 제한으로 확인을 끝까지 반복하지 못했습니다.").font(.system(size: 11)).foregroundStyle(Theme.text3)
-                    }
-                    if let f = r.fit {
-                        Text("수식 모델 적합도 \(Int((f * 100).rounded()))% (시작점 계산용 참고값)").font(.system(size: 11)).foregroundStyle(Theme.text3)
-                    }
-                }
-                if let bal = r.balance { balanceView(bal, names: r.speakerNames) }
-                listenView(r)
-                ForEach(r.warnings, id: \.self) { Text("⚠︎ \($0)").font(.system(size: 11.5)).foregroundStyle(Theme.pink).fixedSize(horizontal: false, vertical: true) }
+                .padding(.trailing, 6)
             }
-            Spacer()
             HStack {
                 button("닫기", primary: false) { model.closeCalibration() }
                 Spacer()
@@ -166,6 +117,54 @@ struct CalibrationSheet: View {
                     .opacity((r?.measuredImprovement ?? 1) < 0.02 ? 0.4 : 1)
             }
         }
+    }
+
+    @ViewBuilder private func resultBody(_ r: CalibrationReport) -> some View {
+        let o = r.outcome
+        VStack(alignment: .leading, spacing: 10) {
+            if let mb = r.measuredBefore, let ma = r.measuredAfter, let imp = r.measuredImprovement {
+                Text(imp < 0.02 ? "이미 소리가 거의 같은 순간에 도착합니다 (도착 시간 차이 \(fmt(mb)) ms)" : "스피커 간 도착 시간 차이 \(fmt(mb)) ms → \(fmt(ma)) ms")
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+            } else {
+                Text("도착 시간을 비교할 수 없습니다").font(.system(size: 15, weight: .bold, design: .rounded))
+            }
+            Text("마이크 \(r.micsUsed.joined(separator: ", ")) 위치 기준 · 노래 전체를 \(r.evaluations)구간으로 나눠 측정")
+                .font(.system(size: 11)).foregroundStyle(Theme.text3)
+            HStack(spacing: 8) {
+                Text("방 이름").font(.system(size: 11.5)).foregroundStyle(Theme.text2)
+                TextField("내 방", text: Binding(get: { model.calRoomName }, set: { model.setCalRoomName($0) }))
+                    .textFieldStyle(.plain).font(.system(size: 12.5, weight: .medium))
+                    .padding(.horizontal, 10).frame(height: 26)
+                    .background(Capsule().fill(Color.white.opacity(0.08)))
+            }
+            Divider().overlay(Color.white.opacity(0.1))
+            ForEach(Array(r.speakerNames.enumerated()), id: \.offset) { i, name in
+                HStack {
+                    Text(name).font(.system(size: 13)).lineLimit(1)
+                    Spacer()
+                    if r.excluded.contains(name) {
+                        Text("제외 (소리 안 잡힘)").font(.system(size: 12)).foregroundStyle(Theme.text3)
+                    } else {
+                        Text("지연 +\(fmt(o.delaysMs[i])) ms").font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit())
+                            .foregroundStyle(Theme.cyan)
+                    }
+                }
+            }
+        }
+        .padding(16).card(highlighted: true)
+
+        if let c = model.calCharts {
+            CalibrationChartsView(charts: c).padding(16).card()
+        }
+
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(r.confidenceNotes, id: \.self) {
+                Text("· \($0)").font(.system(size: 11)).foregroundStyle(Theme.text3).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        if let bal = r.balance { balanceView(bal, names: r.speakerNames) }
+        listenView(r)
+        ForEach(r.warnings, id: \.self) { Text("⚠︎ \($0)").font(.system(size: 11.5)).foregroundStyle(Theme.pink).fixedSize(horizontal: false, vertical: true) }
     }
 
     /// Reference only: the user's volumes are not touched.
@@ -208,7 +207,7 @@ struct CalibrationSheet: View {
             }
             let a = model.feedbackAgreement
             if a.total >= 3 {
-                Text("지금까지 \(a.total)번 중 \(a.agree)번 울림 지수와 귀의 판단이 일치했습니다.").font(.system(size: 11)).foregroundStyle(Theme.text3)
+                Text("지금까지 \(a.total)번 중 \(a.agree)번 측정 결과와 귀의 판단이 일치했습니다.").font(.system(size: 11)).foregroundStyle(Theme.text3)
             }
         }
     }

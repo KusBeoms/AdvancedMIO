@@ -1,9 +1,14 @@
 import SwiftUI
 
-enum SideTab { case source, spatial }
+enum SideTab { case source, spatial, dev }
 
 struct ContentView: View {
-    @StateObject private var model = AppModel()
+    @EnvironmentObject private var model: AppModel
+    @StateObject private var lab = DevLab()
+    @StateObject private var resonance = ResonanceLab()
+    @State private var showHistory = false
+    @State private var presetNameDraft = ""
+    @State private var askPresetName = false
     @State private var sideTab: SideTab = CommandLine.arguments.contains("--demo-spatial") ? .spatial : .source
 
     var body: some View {
@@ -12,9 +17,10 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 header
                 if let e = model.error { errorBanner(e) }
+                ForEach(model.latencyAlerts) { latencyBanner($0) }
                 HStack(alignment: .top, spacing: 18) {
                     sourceColumn.frame(width: 300)
-                    outputsColumn
+                    if sideTab == .dev { DevPage().environmentObject(model).environmentObject(lab).environmentObject(resonance) } else { outputsColumn }
                 }
                 .padding(.horizontal, 22)
                 .padding(.bottom, 14)
@@ -24,8 +30,17 @@ struct ContentView: View {
         .foregroundStyle(.white)
         .preferredColorScheme(.dark)
         .frame(minWidth: 980, minHeight: 620)
+        .onChange(of: sideTab) { if $0 != .dev { lab.stop(); resonance.stop() } }
         .sheet(isPresented: Binding(get: { model.calPhase != .idle }, set: { if !$0 { model.closeCalibration() } })) {
             CalibrationSheet().environmentObject(model)
+        }
+        .sheet(isPresented: $showHistory) { CalibrationHistorySheet().environmentObject(model) }
+        .alert("프리셋 저장", isPresented: $askPresetName) {
+            TextField("이름 (예: 거실)", text: $presetNameDraft)
+            Button("저장") { model.savePreset(named: presetNameDraft) }
+            Button("취소", role: .cancel) {}
+        } message: {
+            Text("켜 둔 기기, 지연, 음량, EQ, 공간 배치를 함께 저장합니다. 같은 이름이면 덮어씁니다.")
         }
     }
 
@@ -46,6 +61,7 @@ struct ContentView: View {
             }
             Spacer()
             StatusPill(running: model.capturing, armed: model.running)
+            settingsMenu
             Button { model.refresh() } label: {
                 Symbol("arrow.clockwise", size: 13)
                     .frame(width: 34, height: 34)
@@ -57,6 +73,42 @@ struct ContentView: View {
         .padding(.horizontal, 22)
         .padding(.top, 34)      // room for the hidden title bar's traffic lights
         .padding(.bottom, 16)
+    }
+
+    private var settingsMenu: some View {
+        Menu {
+            Toggle("지연 변화 경고 표시", isOn: Binding(get: { model.latencyWarningsEnabled }, set: { model.setLatencyWarnings($0) }))
+            Toggle("전역 단축키 (⌃⌥⌘ S · Z · 1–9)", isOn: Binding(get: { model.hotkeysEnabled }, set: { model.setHotkeys($0) }))
+            Toggle("로그인 시 자동 실행", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
+        } label: {
+            Symbol("gearshape", size: 13)
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(Color.white.opacity(0.08)))
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .help("설정")
+    }
+
+    /// Display only: nothing is changed. Hidden by × (until the latency moves again) or switched off for good.
+    private func latencyBanner(_ a: LatencyAlert) -> some View {
+        HStack(spacing: 10) {
+            Symbol("clock.badge.exclamationmark", size: 14).foregroundStyle(Color(hex: 0xFFB84D))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(a.name): 하드웨어 지연이 \(Int(a.fromMs.rounded())) → \(Int(a.toMs.rounded())) ms 로 바뀌었습니다")
+                    .font(.system(size: 12.5, weight: .semibold))
+                Text(a.toMs > a.fromMs ? "소리가 다른 기기보다 늦어졌을 수 있습니다. 지연을 다시 맞춰 보세요." : "소리가 다른 기기보다 빨라졌을 수 있습니다. 지연을 다시 맞춰 보세요.")
+                    .font(.system(size: 11.5)).foregroundStyle(Theme.text2)
+            }
+            Spacer()
+            Button("경고 끄기") { model.setLatencyWarnings(false) }
+                .buttonStyle(.plain).font(.system(size: 11.5, weight: .semibold)).foregroundStyle(Theme.text2)
+            Button { model.dismissLatencyAlert(a.uid) } label: { Symbol("xmark", size: 10, weight: .bold) }
+                .buttonStyle(.plain).foregroundStyle(Theme.text2)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color(hex: 0xFFB84D).opacity(0.13)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color(hex: 0xFFB84D).opacity(0.4)))
+        .padding(.horizontal, 22).padding(.bottom, 12)
     }
 
     private var startButton: some View {
@@ -109,6 +161,7 @@ struct ContentView: View {
             HStack(spacing: 6) {
                 sideTabButton(.source, "SOURCE")
                 sideTabButton(.spatial, "공간음향")
+                sideTabButton(.dev, "개발자 모드")
                 Spacer()
                 if model.spatialOn { Text("ON").font(.system(size: 10, weight: .bold)).foregroundStyle(Theme.cyan) }
             }
@@ -116,6 +169,7 @@ struct ContentView: View {
             switch sideTab {
             case .source: SourceCard().environmentObject(model)
             case .spatial: SpatialCard().environmentObject(model)
+            case .dev: DevSummaryCard().environmentObject(lab)
             }
             Spacer(minLength: 0)
         }
@@ -132,37 +186,65 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
 
+    private func pill(_ symbol: String, _ title: String, accent: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Symbol(symbol, size: 11)
+                Text(title)
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .padding(.horizontal, 10).frame(height: 24)
+            .background(Capsule().fill(accent ? AnyShapeStyle(Theme.accent.opacity(0.85)) : AnyShapeStyle(Color.white.opacity(0.09))))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var presetMenu: some View {
+        Menu {
+            ForEach(model.presets) { p in
+                Button { model.applyPreset(p.id) } label: {
+                    Text(model.activePresetID == p.id ? "✓ \(p.name)" : p.name)
+                }
+            }
+            if !model.presets.isEmpty { Divider() }
+            Button("현재 설정을 프리셋으로 저장…") { presetNameDraft = model.activePreset?.name ?? ""; askPresetName = true }
+            if !model.presets.isEmpty {
+                Menu("프리셋 삭제") {
+                    ForEach(model.presets) { p in Button(p.name, role: .destructive) { model.deletePreset(p.id) } }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Symbol("square.stack.3d.up", size: 11)
+                Text(model.activePreset?.name ?? "프리셋")
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .padding(.horizontal, 10).frame(height: 24)
+            .background(Capsule().fill(Color.white.opacity(0.09)))
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .help("기기 조합·지연·음량·EQ·공간 배치를 이름 붙여 저장하고 불러옵니다")
+    }
+
     private var outputsColumn: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                sectionTitle("OUTPUTS", "가장 늦은 기기에 자동 정렬")
-                Button { model.allAuto() } label: {
-                    HStack(spacing: 5) {
-                        Symbol("arrow.counterclockwise", size: 11)
-                        Text("모두 자동")
-                    }
-                    .font(.system(size: 11, weight: .semibold))
-                    .padding(.horizontal, 10).frame(height: 24)
-                        .background(Capsule().fill(Color.white.opacity(0.09)))
-                }
-                .buttonStyle(.plain)
-                .disabled(!model.canAllAuto)
-                .opacity(model.canAllAuto ? 1 : 0.35)
-                .help("모든 기기를 장치가 보고하는 하드웨어 지연으로 되돌립니다")
-                Button { model.openCalibration() } label: {
-                    HStack(spacing: 5) {
-                        Symbol("waveform.badge.magnifyingglass", size: 11)
-                        Text("룸 캘리브레이션")
-                    }
-                    .font(.system(size: 11, weight: .semibold))
-                    .padding(.horizontal, 10).frame(height: 24)
-                    .background(Capsule().fill(Theme.accent.opacity(0.85)))
-                }
-                .buttonStyle(.plain)
-                .disabled(!model.canCalibrate)
-                .opacity(model.canCalibrate ? 1 : 0.35)
-                .help("마이크로 방의 울림을 측정해 기기별 지연을 자동으로 계산합니다 (출력 2개 이상 + 마이크 필요)")
+            sectionTitle("OUTPUTS", "가장 늦은 기기에 자동 정렬")
+            HStack(spacing: 8) {
+                presetMenu
+                pill("arrow.counterclockwise", "모두 자동") { model.allAuto() }
+                    .disabled(!model.canAllAuto).opacity(model.canAllAuto ? 1 : 0.35)
+                    .help("모든 기기를 장치가 보고하는 하드웨어 지연으로 되돌립니다")
+                pill("arrow.down.to.line", "최저 지연 0으로") { model.zeroMinLag() }
+                    .disabled(!model.canZeroLag).opacity(model.canZeroLag ? 1 : 0.35)
+                    .help("켜 둔 기기 중 가장 낮은 지연이 0이 되도록 모두 같은 만큼 내립니다. 기기 간 차이(들리는 싱크)는 그대로입니다")
+                Spacer(minLength: 0)
+                pill("clock.arrow.circlepath", model.calHistory.isEmpty ? "기록" : "기록 \(model.calHistory.count)") { showHistory = true }
+                    .help(model.calibrationStaleReason.map { "재측정 권장: \($0)" } ?? "지난 캘리브레이션 결과와 비교")
+                pill("waveform.badge.magnifyingglass", model.calibrationStaleReason == nil ? "룸 캘리브레이션" : "룸 캘리브레이션 ●", accent: true) { model.openCalibration() }
+                    .disabled(!model.canCalibrate).opacity(model.canCalibrate ? 1 : 0.35)
+                    .help("마이크로 기기별 소리 도착 시간을 재서 지연을 자동으로 계산합니다 (출력 2개 이상 + 마이크 필요)")
             }
+            .padding(.horizontal, 4)
             ScrollView {
                 VStack(spacing: 12) {
                     ForEach(model.outputDevices) { d in OutputCard(device: d).environmentObject(model) }
@@ -190,153 +272,5 @@ struct ContentView: View {
         }
         .font(.system(size: 11.5)).foregroundStyle(Theme.text3)
         .padding(.horizontal, 26).padding(.bottom, 14)
-    }
-}
-
-// MARK: - Pieces
-
-struct StatusPill: View {
-    let running: Bool
-    var armed = false
-    @State private var pulse = false
-    var body: some View {
-        HStack(spacing: 7) {
-            Circle().fill(running ? Color(hex: 0x3DDC97) : Color.white.opacity(0.3))
-                .frame(width: 8, height: 8)
-                .scaleEffect(running && pulse ? 1.35 : 1)
-                .shadow(color: running ? Color(hex: 0x3DDC97).opacity(0.8) : .clear, radius: 4)
-            Text(running ? "LIVE" : (armed ? "재생 대기" : "대기 중")).font(.system(size: 11, weight: .bold)).tracking(running ? 1.2 : 0)
-        }
-        .foregroundStyle(running ? Color(hex: 0x3DDC97) : Theme.text2)
-        .padding(.horizontal, 12).frame(height: 28)
-        .background(Capsule().fill(Color.white.opacity(0.06)))
-        .onAppear { withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { pulse = true } }
-    }
-}
-
-struct SourceCard: View {
-    @EnvironmentObject var model: AppModel
-
-    var body: some View {
-        let device = model.virtualDevice
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                IconBadge(symbol: "waveform.path", active: device != nil)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("AdvancedMIO").font(.system(size: 14, weight: .semibold))
-                    Text(device == nil ? "가상 출력 장치 · 설치 필요" : "가상 출력 장치 · 2ch 48 kHz")
-                        .font(.system(size: 11)).foregroundStyle(Theme.text3)
-                }
-                Spacer()
-            }
-            if device != nil {
-                if model.capturing { LevelMeter(source: { model.inputLevel(AppModel.virtualUID) }, height: 4) }
-                else { Capsule().fill(Color.white.opacity(0.06)).frame(height: 4) }
-                VStack(alignment: .leading, spacing: 6) {
-                    step("1", "제어 센터 ▸ 소리 에서 AdvancedMIO 선택")
-                    step("2", "오른쪽에서 소리를 내보낼 장치를 켜고 지연 조절")
-                    if model.driverOutdated {
-                        Text("설치된 드라이버가 오래되어 시스템 음량 조절이 안 되고 마이크 표시가 뜹니다. 업데이트하세요.")
-                            .font(.system(size: 11.5)).foregroundStyle(Theme.pink).fixedSize(horizontal: false, vertical: true)
-                        Button { model.installDriver() } label: {
-                            HStack(spacing: 8) {
-                                if model.installing { ProgressView().controlSize(.small).tint(.white) }
-                                else { Symbol("arrow.triangle.2.circlepath", size: 12) }
-                                Text(model.installing ? "업데이트 중…" : "드라이버 업데이트")
-                            }
-                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
-                            .padding(.horizontal, 16).frame(height: 32)
-                            .background(Capsule().fill(Theme.accent))
-                        }
-                        .buttonStyle(.plain).disabled(model.installing)
-                    }
-                }
-            } else {
-                Text("제어 센터에 나타나는 출력 장치 'AdvancedMIO'를 만들려면 가상 오디오 드라이버를 한 번 설치해야 합니다. 관리자 암호를 물어봅니다.")
-                    .font(.system(size: 11.5)).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
-                Button { model.installDriver() } label: {
-                    HStack(spacing: 8) {
-                        if model.installing { ProgressView().controlSize(.small).tint(.white) }
-                        else { Symbol("square.and.arrow.down", size: 12) }
-                        Text(model.installing ? "설치 중…" : "드라이버 설치")
-                    }
-                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
-                    .padding(.horizontal, 16).frame(height: 32)
-                    .background(Capsule().fill(Theme.accent))
-                }
-                .buttonStyle(.plain).disabled(model.installing)
-            }
-        }
-        .padding(16)
-        .card(highlighted: device != nil)
-    }
-
-    private func step(_ n: String, _ text: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(n).font(.system(size: 10, weight: .bold, design: .rounded))
-                .frame(width: 16, height: 16).background(Circle().fill(Color.white.opacity(0.1)))
-            Text(text).font(.system(size: 11.5)).foregroundStyle(Theme.text2)
-        }
-    }
-}
-
-struct OutputCard: View {
-    @EnvironmentObject var model: AppModel
-    let device: AudioDeviceInfo
-
-    @ViewBuilder private var appliedLabel: some View {
-        if model.isReference(device.uid) {
-            Text("기준 · 가장 늦은 기기").foregroundStyle(Theme.cyan)
-                .font(.system(size: 11, weight: .medium))
-        } else {
-            let ms = model.appliedDelayMs(device.uid)
-            Text(ms < 0.5 ? "지연 없음" : "기준에 맞춰 \(Int(ms.rounded())) ms 늦춤")
-                .font(.system(size: 11)).foregroundStyle(Theme.text2)
-        }
-    }
-
-    var body: some View {
-        let cfg = model.config(device.uid)
-        let on = cfg.enabled
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                IconBadge(symbol: device.symbol(forOutput: true), active: on)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(device.name).font(.system(size: 14, weight: .semibold)).lineLimit(1)
-                    HStack(spacing: 6) {
-                        Text("\(device.transport.label) · \(device.outputChannels)ch")
-                        if let ms = model.hwLatencyMs[device.uid] {
-                            Text("·"); Text("HW ≈ \(String(format: "%.0f", ms)) ms")
-                        }
-                    }
-                    .font(.system(size: 11)).foregroundStyle(Theme.text3)
-                    if on { appliedLabel }
-                }
-                Spacer()
-                Toggle("", isOn: Binding(get: { on }, set: { model.setEnabled(device.uid, $0) }))
-                    .toggleStyle(.switch).labelsHidden().tint(Theme.violet)
-            }
-
-            DelayScrubber(value: model.totalLag(device.uid), onChange: { model.setTotalLag(device.uid, $0) }, enabled: on,
-                          autoOn: cfg.auto, onAuto: { model.setAuto(device.uid, $0) },
-                          forceBubble: CommandLine.arguments.contains("--demo-drag") && device.uid == "AirPods Pro")
-
-            HStack(spacing: 10) {
-                Symbol(model.deviceVolume(device.uid) == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill", size: 11, weight: .regular)
-                    .foregroundStyle(Theme.text3).frame(width: 16)
-                Slider(value: Binding(get: { model.deviceVolume(device.uid) }, set: { model.setDeviceVolume(device.uid, $0) }), in: 0...AppModel.maxVolume)
-                    .tint(Theme.violet).controlSize(.small)
-                    .frame(width: 140)
-                Text("\(Int((model.deviceVolume(device.uid) * 100).rounded()))%")
-                    .font(.system(size: 11, weight: .medium)).monospacedDigit().foregroundStyle(Theme.text3)
-                    .frame(width: 40, alignment: .trailing)
-                if on && model.capturing { LevelMeter(source: { model.outputLevel(device.uid) }, height: 4) }
-                else { Capsule().fill(Color.white.opacity(0.06)).frame(height: 4) }
-            }
-            .opacity(on ? 1 : 0.4)
-            .allowsHitTesting(on)
-        }
-        .padding(16)
-        .card(highlighted: on)
     }
 }

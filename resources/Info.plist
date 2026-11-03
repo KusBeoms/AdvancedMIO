@@ -13,4 +13,8 @@
 <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
 <key>NSMicrophoneUsageDescription</key><string>선택한 입력 장치의 오디오를 출력 장치로 전달하기 위해 필요합니다.</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>CFBundleURLTypes</key><array><dict>
+<key>CFBundleURLName</key><string>com.kusbeoms.advancedmio.control</string>
+<key>CFBundleURLSchemes</key><array><string>advancedmio</string></array>
+</dict></array>
 </dict></plist>

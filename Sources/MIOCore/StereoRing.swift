@@ -1,3 +1,5 @@
+import Foundation
+
 /// Stereo float ring buffer: one writer (input IOProc), many readers (output IOProcs).
 /// Frame indices grow monotonically; `index & mask` addresses storage.
 public final class StereoRing {
@@ -9,6 +11,12 @@ public final class StereoRing {
     private let lock = AudioLock()
     private var written = 0
     private var biggestChunk = 0
+    private var lastWriteTime = 0.0
+
+    /// Seconds on a monotonic clock. Readers use it to place themselves *between* the writer's chunk boundaries (the writer
+    /// delivers whole chunks, so the write index alone is a sawtooth). Tests replace it with simulated time.
+    public var clock: () -> Double = StereoRing.hostSeconds
+    public static func hostSeconds() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e9 }
 
     public init(sampleRate: Double, capacityFrames: Int = 1 << 19) {
         precondition(capacityFrames > 0 && capacityFrames & (capacityFrames - 1) == 0, "capacity must be a power of two")
@@ -28,6 +36,7 @@ public final class StereoRing {
         guard frames > 0 else { return }
         let n = min(frames, capacity)
         let skip = frames - n
+        let now = clock()
         lock.lock()
         for i in 0..<n {
             let p = (written + i) & mask
@@ -35,13 +44,14 @@ public final class StereoRing {
         }
         written += frames
         if frames > biggestChunk { biggestChunk = frames }
+        lastWriteTime = now
         lock.unlock()
     }
 
-    /// Runs `body` with the lock held: (writeIndex, maxChunk, left, right, mask).
+    /// Runs `body` with the lock held: (writeIndex, maxChunk, left, right, mask, time of the last write).
     @inline(__always)
-    func locked<T>(_ body: (Int, Int, UnsafePointer<Float>, UnsafePointer<Float>, Int) -> T) -> T {
+    func locked<T>(_ body: (Int, Int, UnsafePointer<Float>, UnsafePointer<Float>, Int, Double) -> T) -> T {
         lock.lock(); defer { lock.unlock() }
-        return body(written, biggestChunk, UnsafePointer(l), UnsafePointer(r), mask)
+        return body(written, biggestChunk, UnsafePointer(l), UnsafePointer(r), mask, lastWriteTime)
     }
 }

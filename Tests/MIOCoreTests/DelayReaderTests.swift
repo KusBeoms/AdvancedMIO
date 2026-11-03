@@ -1,26 +1,34 @@
 import XCTest
 @testable import MIOCore
 
+private final class SimClock { var t = 0.0 }
+
 /// Drives writer/reader the way two CoreAudio devices would: fixed-size callbacks at their own rates.
 private struct Sim {
+    let clock = SimClock()
     let ring: StereoRing
     let reader: DelayReader
     let inRate: Double, outRate: Double
+    /// The rate the output device really runs at, when it differs from the nominal `outRate` the reader is told (clock drift).
+    let outClock: Double
     var inFrame = 0                 // next input frame index (signal = f(inFrame))
     var outTime = 0.0               // seconds of output rendered
     var inTime = 0.0                // seconds of input delivered
     var out: [Float] = []           // left channel output
     var signal: (Int) -> Float
 
-    init(inRate: Double = 48000, outRate: Double = 48000, delayMs: Double = 0,
+    init(inRate: Double = 48000, outRate: Double = 48000, outClock: Double? = nil, delayMs: Double = 0,
          signal: @escaping (Int) -> Float = { Float($0) * 1e-6 }) {
-        self.inRate = inRate; self.outRate = outRate
+        self.inRate = inRate; self.outRate = outRate; self.outClock = outClock ?? outRate
         ring = StereoRing(sampleRate: inRate)
+        let c = clock
+        ring.clock = { c.t }
         reader = DelayReader(ring: ring, outputSampleRate: outRate, delayMs: delayMs)
         self.signal = signal
     }
 
     mutating func writeBlock(_ n: Int) {
+        clock.t = inTime
         var l = (0..<n).map { signal(inFrame + $0) }
         var r = l
         l.withUnsafeMutableBufferPointer { lp in r.withUnsafeMutableBufferPointer { rp in
@@ -29,11 +37,12 @@ private struct Sim {
         inTime += Double(n) / inRate
     }
     mutating func readBlock(_ n: Int) {
+        clock.t = outTime
         var l = [Float](repeating: 0, count: n), r = l
         l.withUnsafeMutableBufferPointer { lp in r.withUnsafeMutableBufferPointer { rp in
             reader.render(into: lp.baseAddress!, rp.baseAddress!, frames: n) } }
         out.append(contentsOf: l)
-        outTime += Double(n) / outRate
+        outTime += Double(n) / outClock
     }
     /// Run for `seconds` with writer chunk `wChunk` and reader chunk `rChunk`, scheduling by time.
     mutating func run(seconds: Double, wChunk: Int = 512, rChunk: Int = 512) {
@@ -50,7 +59,7 @@ final class DelayReaderTests: XCTestCase {
         let last = sim.out.suffix(tail)
         let avg = last.reduce(0, +) / Float(last.count)
         let playedFrame = Double(avg) / 1e-6 + 0     // input-frame index being played (averaged window)
-        let newest = Double(sim.inFrame)
+        let newest = sim.outTime * sim.inRate     // where the input is *now* (inFrame itself jumps in whole chunks)
         return (newest - playedFrame) / sim.inRate * 1000
     }
 
@@ -125,17 +134,54 @@ final class DelayReaderTests: XCTestCase {
     func testDriftCompensationKeepsLagBounded() {
         // Output clock 0.05% faster than input (≈ 24 frames/s) for 60 s.
         var sim = Sim(inRate: 48000, outRate: 48024, delayMs: 200)
-        sim.run(seconds: 2)
+        sim.run(seconds: 6)
         let d0 = measuredDelayMs(sim)
         sim.run(seconds: 60)
         XCTAssertEqual(measuredDelayMs(sim), d0, accuracy: 3)
         XCTAssertLessThanOrEqual(sim.reader.resyncCount, 1)
         // And the other direction.
         var sim2 = Sim(inRate: 48024, outRate: 48000, delayMs: 200)
-        sim2.run(seconds: 2)
+        sim2.run(seconds: 6)
         let e0 = measuredDelayMs(sim2)
         sim2.run(seconds: 60)
         XCTAssertEqual(measuredDelayMs(sim2), e0, accuracy: 3)
+    }
+
+    func testRealClockDriftIsAbsorbedWithoutWobble() {
+        // The device claims 48000 Hz but its clock runs 500 ppm fast (and, in the other run, slow): the reader is not
+        // told, so the lag control has to find and follow the mismatch on its own.
+        for clock in [48024.0, 47976.0] {
+            var sim = Sim(inRate: 48000, outRate: 48000, outClock: clock, delayMs: 100)
+            sim.run(seconds: 8)
+            let d0 = measuredDelayMs(sim)
+            sim.run(seconds: 40)
+            XCTAssertEqual(measuredDelayMs(sim), d0, accuracy: 3, "clock \(clock)")
+            XCTAssertLessThanOrEqual(sim.reader.resyncCount, 1, "clock \(clock)")
+            let x = Array(sim.out.suffix(96000))
+            var worst = 0.0
+            // 2048-frame windows: by now the ramp has grown large enough that Float resolution blurs shorter ones.
+            for i in stride(from: 0, to: x.count - 2048, by: 101) {
+                let slope = Double(x[i + 2048] - x[i]) / 2048 / 1e-6
+                worst = max(worst, abs(slope - 1))
+            }
+            XCTAssertLessThan(worst, 0.003, "clock \(clock): speed deviation \(worst * 100) %")
+        }
+    }
+
+    /// Playback speed must not wobble: a ramp (slope 1e-6/frame) read at the same rate must keep its slope within
+    /// 0.2 % over every 256-frame window (shorter windows hit the ramp's Float resolution). Chunked writers used to make the drift correction swing speed by ±1 %,
+    /// which is audible as roughness / "broken" sound.
+    func testPlaybackSpeedIsStable() {
+        for (w, r) in [(512, 512), (480, 512), (256, 1024), (1024, 256)] {
+            var sim = Sim(delayMs: 40); sim.run(seconds: 4, wChunk: w, rChunk: r)
+            let x = Array(sim.out.suffix(96000))
+            var worst = 0.0
+            for i in stride(from: 0, to: x.count - 256, by: 17) {
+                let slope = Double(x[i + 256] - x[i]) / 256 / 1e-6
+                worst = max(worst, abs(slope - 1))
+            }
+            XCTAssertLessThan(worst, 0.002, "speed wobbled by \(worst * 100) % with writer \(w) / reader \(r)")
+        }
     }
 
     func testSampleRateConversionPreservesPitch() {
@@ -148,6 +194,67 @@ final class DelayReaderTests: XCTestCase {
         for i in 1..<x.count where x[i - 1] < 0 && x[i] >= 0 { crossings += 1 }
         XCTAssertEqual(Double(crossings), f, accuracy: 3)    // 1 s window → ~1000 zero crossings
         XCTAssertLessThan(x.map { abs($0) }.max()! , 1.01)
+    }
+
+    func testPlaybackSpeedStaysStableWithClockDrift() {
+        // Output clock 0.05 % fast: speed may follow the drift (≤ 0.1 %) but not wobble.
+        var sim = Sim(inRate: 48000, outRate: 48024, delayMs: 60)
+        sim.run(seconds: 6)
+        let x = Array(sim.out.suffix(96000))
+        var worst = 0.0
+        for i in stride(from: 0, to: x.count - 256, by: 23) {
+            let slope = Double(x[i + 256] - x[i]) / 256 / 1e-6
+            worst = max(worst, abs(slope - 48000.0 / 48024.0))
+        }
+        XCTAssertLessThan(worst, 0.002)
+    }
+
+    func testResamplingKeepsHighFrequencyLevel() {
+        // 5 kHz tone 44.1 → 48 kHz: linear interpolation would droop by up to ~6 %; cubic stays within ~1 %.
+        var sim = Sim(inRate: 44100, outRate: 48000, delayMs: 20,
+                      signal: { Float(sin(Double($0) * 2 * .pi * 5000 / 44100)) })
+        sim.run(seconds: 2)
+        let peak = sim.out.suffix(24000).map { abs($0) }.max()!
+        XCTAssertGreaterThan(peak, 0.985)
+        XCTAssertLessThan(peak, 1.015)
+    }
+
+    /// Share of the output that is *not* the expected pure tone (images, aliasing, distortion), in dB.
+    private func residualDb(_ x: [Float], hz: Double, rate: Double) -> Double {
+        var a = 0.0, b = 0.0, power = 0.0
+        for (n, v) in x.enumerated() {
+            let w = 2 * Double.pi * hz * Double(n) / rate
+            a += Double(v) * cos(w); b += Double(v) * sin(w); power += Double(v) * Double(v)
+        }
+        let N = Double(x.count)
+        a *= 2 / N; b *= 2 / N
+        let signal = (a * a + b * b) / 2 * N
+        return 10 * log10(max(1e-20, power - signal) / signal)
+    }
+
+    func testUpsamplingTo96kStaysClean() {
+        // A 96 kHz speaker fed from the 48 kHz virtual device. 15 kHz is where cheap interpolation images the worst.
+        var sim = Sim(inRate: 48000, outRate: 96000, delayMs: 30,
+                      signal: { Float(0.5 * sin(Double($0) * 2 * .pi * 15000 / 48000)) })
+        sim.run(seconds: 2)      // inside the settle period: no speed trim yet, so only the resampler is measured
+        let x = Array(sim.out.suffix(2400))
+        XCTAssertLessThan(residualDb(x, hz: 15000, rate: 96000), -55)
+    }
+
+    func testDownsamplingDoesNotAlias() {
+        // 96 kHz → 48 kHz of a 30 kHz tone: it is above the output's Nyquist and must vanish, not fold down to 18 kHz.
+        var sim = Sim(inRate: 96000, outRate: 48000, delayMs: 30,
+                      signal: { Float(0.5 * sin(Double($0) * 2 * .pi * 30000 / 96000)) })
+        sim.run(seconds: 3)
+        let peak = sim.out.suffix(9600).map { abs($0) }.max()!
+        XCTAssertLessThan(peak, 0.01)
+    }
+
+    func testSameRateIsTransparent() {
+        var sim = Sim(inRate: 48000, outRate: 48000, delayMs: 30,
+                      signal: { Float(0.5 * sin(Double($0) * 2 * .pi * 12000 / 48000)) })
+        sim.run(seconds: 2)
+        XCTAssertLessThan(residualDb(Array(sim.out.suffix(1200)), hz: 12000, rate: 48000), -60)
     }
 
     func testMismatchedBufferSizesStayStable() {

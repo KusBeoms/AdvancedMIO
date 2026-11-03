@@ -31,7 +31,7 @@ struct SpatialCard: View {
                     .frame(maxWidth: .infinity)
                     .opacity(on ? 1 : 0.5)
                 legend
-                Text("각 기기는 점 하나로 취급되어 위치에 맞는 소리를 냅니다. 노드를 끌면 위치, 작은 점을 끌면 스피커 방향, 가운데 사람의 점을 끌면 정면이 바뀝니다 (⌥ = 5° 단위).")
+                Text("각 기기는 점 하나로 취급되어 위치에 맞는 소리를 내고, 가까운 기기는 거리에 맞게 늦춰 소리가 동시에 도착합니다. 노드를 끌면 위치와 거리(가운데로 끌면 모든 소리를 내는 중앙 스피커), 작은 점을 끌면 스피커 방향, 가운데 사람의 점을 끌면 정면이 바뀝니다 (⌥ = 5° 단위).")
                     .font(.system(size: 10.5)).foregroundStyle(Theme.text3).fixedSize(horizontal: false, vertical: true)
                 Button { model.resetSpatial() } label: {
                     HStack(spacing: 5) {
@@ -57,7 +57,9 @@ struct SpatialCard: View {
                         .frame(width: 16, height: 16).background(Circle().fill(Theme.violet.opacity(0.55)))
                     Text(d.name).font(.system(size: 11.5)).lineLimit(1)
                     Spacer()
-                    Text("\(Int(model.spatialAngle(d.uid).rounded()))° · 방향 \(Int(model.spatialAimOffset(d.uid).rounded()))°")
+                    Text(model.spatialRadius(d.uid) < 0.02 ? "중앙 · 모든 소리"
+                         : String(format: "%d° · %.1f m · 방향 %d°", Int(model.spatialAngle(d.uid).rounded()),
+                                  model.spatialDistanceMeters(d.uid), Int(model.spatialAimOffset(d.uid).rounded())))
                         .font(.system(size: 10.5)).monospacedDigit().foregroundStyle(Theme.text3)
                 }
             }
@@ -99,7 +101,7 @@ struct SpatialStage: View {
                 ctx.stroke(Path(ellipseIn: CGRect(x: c.x - ring / 2, y: c.y - ring / 2, width: ring, height: ring)),
                            with: .color(.white.opacity(0.07)), style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
                 for d in speakers {
-                    let p = point(model.spatialAngle(d.uid), ring, from: c)
+                    let p = point(model.spatialAngle(d.uid), ring * model.spatialRadius(d.uid), from: c)
                     var line = Path(); line.move(to: c); line.addLine(to: p)
                     ctx.stroke(line, with: .color(.white.opacity(0.06)), lineWidth: 1)
                     // The cone the speaker projects its sound into.
@@ -129,7 +131,7 @@ struct SpatialStage: View {
                 .help("사람이 바라보는 방향")
 
             ForEach(Array(speakers.enumerated()), id: \.element.id) { i, d in
-                let pos = point(model.spatialAngle(d.uid), ring, from: centre)
+                let pos = point(model.spatialAngle(d.uid), ring * model.spatialRadius(d.uid), from: centre)
                 ZStack {
                     Circle().fill(Theme.accentDiagonal).frame(width: 28, height: 28)
                         .shadow(color: Theme.violet.opacity(0.5), radius: 6)
@@ -137,7 +139,10 @@ struct SpatialStage: View {
                 }
                 .position(pos)
                 .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("stage")).onChanged { g in
-                    model.setSpatialAngle(d.uid, snapped(angle(from: centre, to: g.location)))
+                    let dx = Double(g.location.x - centre.x), dy = Double(g.location.y - centre.y)
+                    let r = min(1, (dx * dx + dy * dy).squareRoot() / Double(ring))
+                    model.setSpatialPlace(d.uid, angle: snapped(angle(from: centre, to: g.location)),
+                                          radius: r < 0.08 ? 0 : (NSEvent.modifierFlags.contains(.option) ? (r * 10).rounded() / 10 : r))
                 })
                 .help(d.name)
 

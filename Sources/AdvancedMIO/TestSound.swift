@@ -15,6 +15,12 @@ enum TestSound {
         return FileManager.default.fileExists(atPath: dev.path) ? dev : nil
     }
 
+    /// Length of the bundled song (at most `maxSeconds`), without decoding it.
+    static var durationSeconds: Double {
+        guard let url, let f = try? AVAudioFile(forReading: url) else { return 0 }
+        return min(Double(f.length) / f.processingFormat.sampleRate, maxSeconds)
+    }
+
     static func load() throws -> LoopSource {
         guard let url else { throw IOError(message: "테스트 음원(TestSound.mp3)을 찾을 수 없습니다") }
         let file = try AVAudioFile(forReading: url)
@@ -77,6 +83,27 @@ final class LoopSource: RingSource {
             delivered += n; need -= n
         }
         if peak > 0 { level = peak }
+    }
+
+    /// The whole clip as mono, at the clip's rate.
+    func fullMono() -> [Float] { (0..<l.count).map { 0.5 * (l[$0] + r[$0]) } }
+
+    /// The whole clip as mono at one fixed gain: a typical loud passage at RMS 0.12, never clipping.
+    func normalizedMono() -> [Float] {
+        let x = fullMono()
+        let hop = Int(rate)
+        var levels: [Double] = []
+        var s = 0
+        while s + hop <= x.count {
+            var sum = 0.0
+            for i in stride(from: s, to: s + hop, by: 5) { sum += Double(x[i] * x[i]) }
+            levels.append((sum / Double(hop / 5)).squareRoot())
+            s += hop
+        }
+        let typical = levels.sorted()[levels.count * 3 / 4]
+        let peak = x.reduce(Float(0)) { max($0, abs($1)) }
+        let g = Float(min(0.12 / max(typical, 1e-6), 0.9 / max(Double(peak), 1e-6)))
+        return x.map { $0 * g }
     }
 
     /// `count` mono excerpts of `seconds` each, taken from the loudest parts of the clip (spread across it), normalised to a

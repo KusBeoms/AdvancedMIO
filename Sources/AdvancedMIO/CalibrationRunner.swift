@@ -134,6 +134,8 @@ struct CalibrationReport {
     /// How many compute → measure rounds were run and how far the measurements corrected the model's arrival times.
     let rounds: Int
     let modelCorrectionMs: [Double]
+    /// The identified room (24 kHz, one entry per microphone) — kept for the developer page's listening test.
+    let room: [MicResponse]
 
     var measuredImprovement: Double? {
         guard let b = measuredBefore, let a = measuredAfter, b > 0 else { return nil }
@@ -187,13 +189,18 @@ final class CalibrationRunner {
     private static let analysisRate = 24_000.0
     private static let emphasis = 0.1
 
-    /// Rough duration of the whole measurement for the UI: identification, the computation, then at most `searchBudgetSeconds`
-    /// of measuring (typically 8–12 measurements of a few seconds each).
-    static func estimatedSeconds(speakers: Int, mics: Int, maxDelayMs: Double = 250) -> Double {
-        let d = maxDelayMs / 1000
+    /// Number of volume plateaus the song is divided into: whole cycles (all speakers equal, then each one emphasised in turn)
+    /// that fit between the song's start and end.
+    static func plateauCount(songSeconds: Double, speakers n: Int, maxDelayMs: Double) -> Int {
+        let K = n + 1, d = maxDelayMs / 1000
         let period = segmentSeconds + 2 * d + rampSeconds + 0.3
-        let measureOnce = settleSeconds + (d > 0.2 ? 5.5 : 2.8) + 0.2
-        return lead + d + Double(speakers + 1) * period + 3 + 12 + min(searchBudgetSeconds, 10 * measureOnce)
+        let fit = Int((songSeconds - 1 - lead - 2 * d - segmentSeconds - 0.8) / period) + 1
+        return max(K, fit / K * K)
+    }
+
+    /// Duration of the whole measurement for the UI: the song once from start to end, then the analysis.
+    static func estimatedSeconds(speakers: Int, mics: Int, maxDelayMs: Double = 250) -> Double {
+        max(30, TestSound.durationSeconds) + 4 + 2 * Double(mics)
     }
 
     private struct Measurement {
@@ -203,7 +210,7 @@ final class CalibrationRunner {
     }
 
     /// Box-average down to about 24 kHz so the many analyses in the search stay fast.
-    private static func reduce(_ x: [Float], rate: Double) -> [Float] {
+    static func reduce(_ x: [Float], rate: Double) -> [Float] {
         let f = max(1, Int(rate / analysisRate))
         var y = x
         if f > 1 {
@@ -233,17 +240,27 @@ final class CalibrationRunner {
         let dMax = (original.max() ?? 0) / 1000
         let period = Self.segmentSeconds + 2 * dMax + ramp + 0.3
         var trials = [JointTrial(startSec: 0, gains: [Double](repeating: 1, count: n), delaysMs: original)]
-        for k in 1...n {
-            trials.append(JointTrial(startSec: 0, gains: (0..<n).map { $0 == k - 1 ? 1 : Self.emphasis }, delaysMs: original))
+        let music = song.normalizedMono()
+        let P = Self.plateauCount(songSeconds: Double(music.count) / fs, speakers: n, maxDelayMs: original.max() ?? 0)
+        for p in 1..<P {
+            let k = p % K            // 0: everybody at full level, k: speaker k−1 at full level and the others softened
+            trials.append(JointTrial(startSec: 0, gains: (0..<n).map { k == 0 || $0 == k - 1 ? 1 : Self.emphasis }, delaysMs: original))
         }
         func plateau(_ k: Int) -> Double { Self.lead + Double(k) * period }
         for k in trials.indices { trials[k].startSec = plateau(k) + dMax }
-        let total = trials[K - 1].startSec + Lseg + dMax + 0.8
-        guard let music = song.excerpts(count: 1, seconds: total + 1).first else { throw CalibrationFailure(message: "테스트 음원이 너무 짧습니다") }
+        let total = trials[P - 1].startSec + Lseg + dMax + 0.8
+        guard music.count > Int((total + 1) * fs) else { throw CalibrationFailure(message: "테스트 음원이 너무 짧습니다") }
+        // The song plays on to its very end; the analysed plateaus come first and everything after is just listening.
+        let playSeconds = max(total, Double(music.count) / fs - 0.3)
         func slice(_ a: Double, _ b: Double) -> [Float] { Array(music[min(music.count, Int(a * fs))..<min(music.count, Int(b * fs))]) }
         func gains(at t: Double) -> [Double] {
             var k = 0
-            for j in 1..<K where t >= plateau(j) - ramp { k = j }
+            for j in 1..<P where t >= plateau(j) - ramp { k = j }
+            let endOfPlateaus = trials[P - 1].startSec + Lseg + dMax
+            if t > endOfPlateaus {                                  // back to everybody at full level for the rest of the song
+                let u = min(1, max(0, (t - endOfPlateaus) / ramp)), s = u * u * (3 - 2 * u)
+                return trials[P - 1].gains.map { $0 + (1 - $0) * s }
+            }
             if k == 0 { return trials[0].gains }
             let u = min(1, max(0, (t - (plateau(k) - ramp)) / ramp)), s = u * u * (3 - 2 * u)   // smoothstep
             return (0..<n).map { trials[k - 1].gains[$0] + (trials[k].gains[$0] - trials[k - 1].gains[$0]) * s }
@@ -251,8 +268,8 @@ final class CalibrationRunner {
 
         var measurements: [Measurement] = []
         do {
-            let recorders = try mics.map { try MicRecorder(device: $0, seconds: total + 2) }
-            let probe = ProbeSource(samples: slice(0, total + 1), sampleRate: fs)
+            let recorders = try mics.map { try MicRecorder(device: $0, seconds: playSeconds + 2) }
+            let probe = ProbeSource(samples: slice(0, playSeconds + 1), sampleRate: fs)
             let engine = try RouterEngine(inputs: [], shared: probe, outputs: speakers.enumerated().map {
                 ($1.device, original[$0], $1.volume * trials[0].gains[$0]) })
             defer { engine.stop(); recorders.forEach { $0.stop() } }
@@ -261,18 +278,18 @@ final class CalibrationRunner {
             let t0s = recorders.map(\.count)
             try engine.start()                                  // source time 0
             var last = trials[0].gains
-            while probe.elapsed < total {
+            while probe.elapsed < playSeconds {
                 try Task.checkCancellation()
                 let g = gains(at: probe.elapsed)
                 if zip(g, last).contains(where: { abs($0 - $1) > 0.002 }) {
                     last = g
                     for (i, sp) in speakers.enumerated() { engine.setGain(uid: sp.device.uid, Float(sp.volume * g[i])) }
                 }
-                tick("1/2 · 스피커 위치·시차 파악 중 (모든 기기 + 모든 마이크)")
+                tick("1/2 · 노래를 처음부터 끝까지 재생하며 스피커별 도착 시간 측정 중")
                 try await Task.sleep(nanoseconds: 20_000_000)
             }
             engine.stop(); recorders.forEach { $0.stop() }
-            tick("녹음 분석 중…")
+            tick("2/2 · 녹음 분석 중…")
             let sources = trials.map { slice($0.startSec, $0.startSec + Lseg) }
             let trialsCopy = trials
             for (mi, r) in recorders.enumerated() {
@@ -315,136 +332,52 @@ final class CalibrationRunner {
             warnings.append("마이크에 거의 잡히지 않은 기기: " + weak.joined(separator: ", ")
                             + " — 이 기기의 지연은 효과를 확인하기 어려워 원래 값에 가깝게 남습니다. 마이크를 가까이 두면 정확해집니다.")
         }
-        let m = active.count
-        let spk = active.map { speakers[$0] }
-        let startOriginal = active.map { original[$0] }
+        // MARK: 2. align the arrivals (computed after the recording, from the whole song at once)
 
-        // MARK: 2. the model and the looping programme
-
-        // Microphones that identified every speaker carry the model; recorders are only needed for those.
         let usable = measurements.indices.filter { qi in active.allSatisfy { measurements[qi].response.speakers[$0] != nil } }
         guard !usable.isEmpty else {
             throw CalibrationFailure(message: "모든 스피커 소리를 식별한 마이크가 없습니다. 마이크를 스피커 가까이 두고 다시 시도하세요.")
         }
         let modelMics = CalibrationAnalysis.restrict(measurements.map(\.response), to: active)
-        let modelMics24 = modelMics.map { $0.resampled(to: Self.analysisRate) }
+        let room = modelMics.map { $0.resampled(to: Self.analysisRate) }
 
-        // The looping programme. Its period (a power of two at the analysis rate) must exceed the longest lag plus one
-        // speaker's response, or the analysis window would cut the response off.
-        let arrivals = modelMics.flatMap { $0.speakers.compactMap { $0?.arrival } }
-        let maxArrival = arrivals.max() ?? 0, minArrival = arrivals.min() ?? 0
-        let needed = maxArrival + (maxArrival - minArrival) + 0.3 + CalibrationAnalysis.responseSeconds
-        let periodSamples = needed <= 65536.0 / Self.analysisRate ? 65536 : 131072
-        let Lp = Double(periodSamples) / Self.analysisRate
-        guard let loop = song.excerpts(count: 1, seconds: Lp).first, !loop.isEmpty else { throw CalibrationFailure(message: "테스트 음원이 너무 짧습니다") }
-        var probe24 = Self.reduce(loop, rate: fs)
-        if probe24.count > periodSamples { probe24 = Array(probe24.prefix(periodSamples)) }
-        else if probe24.count < periodSamples { probe24 += [Float](repeating: 0, count: periodSamples - probe24.count) }
-        let programme = Programme(probe: probe24, rate: Self.analysisRate)
-        let budget = Self.searchBudgetSeconds
-        let loopLen = loop.count
-        var tiled = [Float](repeating: 0, count: Int((budget + 60) * fs))
-        for i in 0..<tiled.count { tiled[i] = loop[i % loopLen] }
-
-        // MARK: 3. closed loop: compute (DelayAI + digital twin) → apply → measure at once, music never stopping
-
-        let recorders = try usable.map { try MicRecorder(device: mics[$0], seconds: budget + 90) }
-        let probe = ProbeSource(samples: tiled, sampleRate: fs)
-        let engine = try RouterEngine(inputs: [], shared: probe, outputs: spk.enumerated().map { ($1.device, startOriginal[$0], $1.volume) })
-        defer { engine.stop(); recorders.forEach { $0.stop() } }
-        for r in recorders { try r.start() }
-        try await Task.sleep(nanoseconds: 300_000_000)
-        let t0s = recorders.map(\.count)
-        try engine.start()
-        try await Task.sleep(nanoseconds: 1_200_000_000)        // let the loop settle in before the first measurement
-        control.setSearching()
-
-        let searchStart = Date()
-        var applied = startOriginal
-        var evaluations = 0
-
-        /// Applies `delays`, waits for them to take effect, and returns the recovered combined response at every microphone.
-        func measureAt(_ delays: [Double], label: String) async throws -> Measured? {
-            for (i, sp) in spk.enumerated() where abs(applied[i] - delays[i]) > 1e-6 { engine.setDelay(uid: sp.device.uid, ms: delays[i]) }
-            applied = delays
-            let a = probe.elapsed + Self.settleSeconds                       // analysed stretch starts once the change has taken effect
-            while probe.elapsed < a + Lp + 0.15 {
-                try Task.checkCancellation()
-                progress(label, min(0.98, 0.25 + 0.7 * Date().timeIntervalSince(searchStart) / budget))
-                try await Task.sleep(nanoseconds: 20_000_000)
-            }
-            // The looped excerpt is periodic: whatever phase the window starts at, it holds one full period, rotated.
-            let phase = Int((a.truncatingRemainder(dividingBy: Lp)) * fs) % loopLen
-            let x = Self.reduce(Array(loop[phase...] + loop[..<phase]), rate: fs)
-            var observations: [Observation] = []
-            for (q, r) in recorders.enumerated() {
-                let rate = r.sampleRate
-                let y = Self.reduce(r.samples(from: t0s[q] + Int((a - 0.1) * rate), to: t0s[q] + Int((a + Lp) * rate)), rate: rate)
-                let arr = modelMics[q].speakers.map { $0!.arrival }
-                let t = zip(arr, delays).map { $0 + $1 / 1000 }
-                let onsetSec = t.min() ?? 0, spreadSec = (t.max() ?? 0) - onsetSec
-                let m = await Task.detached(priority: .userInitiated) {
-                    CalibrationAnalysis.measure(window: y, sampleRate: Self.analysisRate, probe: x, onsetSec: onsetSec, spreadSec: spreadSec)
-                }.value
-                guard let m else { return nil }
-                observations.append(Observation(mic: q, delaysMs: delays, ir: m.ir, pad: m.pad))
-            }
-            return Measured(observations: observations)
+        // Where each speaker's sound reaches the microphone (the applied delay removed), averaged over the microphones.
+        let arrival = (0..<n).map { i in modelMics.map { $0.speakers[i]!.arrival }.reduce(0, +) / Double(modelMics.count) }
+        let maxDelay = 1.0
+        guard let best = CalibrationAnalysis.alignedDelays(modelMics, maxDelayMs: maxDelay * 1000) else {
+            throw CalibrationFailure(message: "모든 스피커 소리를 식별한 마이크가 없습니다. 마이크를 스피커 가까이 두고 다시 시도하세요.")
         }
-
-        func describe(_ step: PlanStep) -> String {
-            switch step {
-            case .original: return "3/3 · 현재 설정 측정 중"
-            case .candidate(let round, _): return "3/3 · 계산된 설정 \(round + 1)차 적용하고 바로 측정 중"
-            case .local(let t):
-                switch t {
-                case .model(let r): return "3/3 · 계산한 보정을 적용하고 바로 확인 중 (±\(Int(r)) ms 이내)"
-                case .explore(let r): return "3/3 · 주변을 시험 중 (±\(Int(r)) ms)"
-                case .confirm: return "3/3 · 좋아 보이는 설정을 한 번 더 확인 중"
-                default: return "3/3 · 현재 최선을 다시 측정 중"
-                }
+        if ((arrival.max() ?? 0) - (arrival.min() ?? 0)) > maxDelay {
+            warnings.append("스피커 사이의 도착 시간 차이가 \(Int(((arrival.max() ?? 0) - (arrival.min() ?? 0)) * 1000)) ms로 지연 한도(\(Int(maxDelay * 1000)) ms)를 넘어 일부는 다 맞추지 못했습니다.")
+        }
+        // A speaker whose strongest peak points downwards is wired the other way round: aligned in time it still cancels the others.
+        for (i, name) in speakers.map(\.device.name).enumerated() {
+            let flipped = modelMics.filter { m in
+                guard let h = m.speakers[i]?.h, let k = h.indices.max(by: { abs(h[$0]) < abs(h[$1]) }) else { return false }
+                return h[k] < 0
+            }.count
+            if flipped * 2 > modelMics.count {
+                warnings.append("\(name): 소리가 다른 스피커와 반대 극성으로 잡혔습니다. 스피커 선이 거꾸로 연결되었을 수 있고, 그러면 시간을 맞춰도 서로 소리가 상쇄됩니다.")
             }
         }
 
-        progress("2/3 · 최적 지연 계산 중 (경사하강법 + 디지털 트윈)", 0.22)
-        guard let plan = try await CalibrationPlanner.run(
-            model: modelMics24, programme: programme, original: startOriginal, maxRounds: 3, repeats: 2,
-            localIterations: Self.loopIterations,
-            compute: { model in
-                await Task.detached(priority: .userInitiated) {
-                    CalibrationPlanner.computeBest(model: model, programme: programme, original: startOriginal)
-                }.value
-            },
-            shouldStop: { control.finishRequested || Date().timeIntervalSince(searchStart) > budget },
-            onBest: { _, best, start in
-                if let start, start > 0 { control.update(improvement: max(0, (start - best) / start)) }
-            },
-            measure: { delays, step in try await measureAt(delays, label: describe(step)) })
-        else { throw CalibrationFailure(message: "마이크로 측정값을 얻지 못했습니다. 스피커 음량을 올리고 마이크를 스피커 가까이 두세요.") }
-        let best = plan.best, bestScore = plan.bestScore, originalScore = plan.startScore
-        // keep the history short enough to show
-        let history: [Double] = plan.history.count <= 12 ? plan.history
-            : (0..<12).map { plan.history[$0 * (plan.history.count - 1) / 11] }
-        let finished = plan.finished
-        evaluations = plan.evaluations
-        if plan.noise > 0.1 {
-            warnings.append("같은 설정을 다시 측정해도 값이 \(Int(plan.noise * 100))% 정도 흔들립니다 (블루투스 지연 변동 등). 작은 개선은 확인할 수 없어, 계산 결과를 우선했습니다.")
+        /// Spread (ms) of the arrival times at the microphone for the given delays, averaged over the microphones.
+        func spread(_ delays: [Double]) -> Double {
+            let s = modelMics.map { m -> Double in
+                let t = (0..<n).map { m.speakers[$0]!.arrival + delays[$0] / 1000 }
+                return ((t.max() ?? 0) - (t.min() ?? 0)) * 1000
+            }
+            return s.reduce(0, +) / Double(s.count)
         }
-        if control.finishRequested { warnings.append("요청에 따라 측정을 일찍 마치고 지금까지의 최선을 사용했습니다.") }
-        let balance = VolumeBalance.power(from: modelMics).flatMap { VolumeBalance.suggest(power: $0) }
-
-        // Normalise (the least delayed speaker at 0) and map back onto all speakers; excluded ones keep their delay.
-        let shift = best.min() ?? 0
-        var delays = original
-        for (q, j) in active.enumerated() { delays[j] = best[q] - shift }
-        let before = originalScore ?? bestScore
-        let outcome = CalibrationOutcome(delaysMs: delays, gains: speakers.map { _ in 1 }, scoreBefore: before, scoreAfter: bestScore)
+        let before = spread(original), after = spread(best)
+        let outcome = CalibrationOutcome(delaysMs: best, gains: speakers.map { _ in 1 }, scoreBefore: before, scoreAfter: after)
         let fit = measurements.isEmpty ? nil : measurements.map(\.fit).reduce(0, +) / Double(measurements.count)
+        let balance = VolumeBalance.power(from: modelMics).flatMap { VolumeBalance.suggest(power: $0) }
         return CalibrationReport(outcome: outcome, speakerUIDs: speakers.map(\.device.uid),
                                  speakerNames: speakers.map(\.device.name), micsUsed: mics.map(\.name), warnings: warnings,
-                                 excluded: excludedNames, measuredBefore: originalScore, measuredAfter: bestScore,
-                                 searchHistory: history, evaluations: evaluations, finished: finished, fit: fit,
-                                 originalDelaysMs: original, balance: balance, rounds: plan.rounds, modelCorrectionMs: plan.biasMs)
+                                 excluded: excludedNames, measuredBefore: before, measuredAfter: after,
+                                 searchHistory: [], evaluations: P, finished: true, fit: fit,
+                                 originalDelaysMs: original, balance: balance, rounds: 0, modelCorrectionMs: [], room: room)
     }
 }
 

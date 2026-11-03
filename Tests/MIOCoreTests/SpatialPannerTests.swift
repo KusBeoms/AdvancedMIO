@@ -58,6 +58,30 @@ final class SpatialPannerTests: XCTestCase {
         }
     }
 
+    func testCentreSpeakerPlaysEverythingUnchanged() {
+        // On top of the listener: full stereo, whatever the angle or the way it faces.
+        XCTAssertEqual(SpatialPanner.mix(positionDeg: 90, radius: 0, aimOffsetDeg: 180), .identity)
+        XCTAssertEqual(SpatialPanner.mix(positionDeg: -30, radius: 0), .identity)
+    }
+
+    func testMovingOutwardFadesFromFullRangeToPlaced() {
+        let ring = SpatialPanner.mix(positionDeg: -90, radius: 1)
+        let half = SpatialPanner.mix(positionDeg: -90, radius: 0.25)
+        XCTAssertEqual(SpatialPanner.mix(positionDeg: -90, radius: SpatialPanner.fullPlacementRadius), ring)
+        XCTAssertGreaterThan(half.rr, ring.rr)              // still carries some right channel
+        XCTAssertLessThan(half.rr, 1)
+        XCTAssertEqual(half.ll, 0.5 * 1 + 0.5 * 1, accuracy: 1e-5)   // ll: identity 1, placed 1
+    }
+
+    func testDistanceAndAlignmentDelay() {
+        XCTAssertEqual(SpatialPanner.distanceMeters(radius: 1), 3, accuracy: 1e-9)
+        XCTAssertEqual(SpatialPanner.distanceMeters(radius: 2), 3, accuracy: 1e-9)
+        XCTAssertEqual(SpatialPanner.distanceMeters(radius: 0.5), 1.5, accuracy: 1e-9)
+        XCTAssertEqual(SpatialPanner.alignDelayMs(distance: 3, farthest: 3), 0, accuracy: 1e-9)
+        XCTAssertEqual(SpatialPanner.alignDelayMs(distance: 0, farthest: 3.43), 10, accuracy: 1e-9)
+        XCTAssertEqual(SpatialPanner.alignDelayMs(distance: 5, farthest: 3), 0, accuracy: 1e-9)
+    }
+
     func testDefaultAngles() {
         XCTAssertEqual(SpatialPanner.defaultAngles(count: 0), [])
         XCTAssertEqual(SpatialPanner.defaultAngles(count: 1), [0])

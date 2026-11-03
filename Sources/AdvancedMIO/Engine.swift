@@ -12,6 +12,19 @@ private func silence(_ list: UnsafeMutablePointer<AudioBufferList>) {
     }
 }
 
+/// Records where each buffer of the device list lives and returns the frame count of the first non-empty one.
+private func gather(_ abl: UnsafeMutableAudioBufferListPointer, into refs: UnsafeMutablePointer<BufferRef>) -> (buffers: Int, frames: Int) {
+    let count = min(abl.count, maxBuffers)
+    var frames = 0
+    for i in 0..<count {
+        let b = abl[i]
+        let ch = max(1, Int(b.mNumberChannels))
+        refs[i] = BufferRef(data: b.mData?.assumingMemoryBound(to: Float.self), channels: ch)
+        if frames == 0, b.mData != nil { frames = Int(b.mDataByteSize) / (MemoryLayout<Float>.size * ch) }
+    }
+    return (count, min(frames, maxFrames))
+}
+
 /// State shared with one input IOProc (audio thread) — captures a device into a ring buffer.
 private final class InputState {
     let ring: StereoRing
@@ -29,15 +42,7 @@ private final class InputState {
     deinit { l.deallocate(); r.deallocate(); refs.deallocate() }
 
     func process(_ abl: UnsafeMutableAudioBufferListPointer) {
-        let count = min(abl.count, maxBuffers)
-        var frames = 0
-        for i in 0..<count {
-            let b = abl[i]
-            let ch = max(1, Int(b.mNumberChannels))
-            refs[i] = BufferRef(data: b.mData?.assumingMemoryBound(to: Float.self), channels: ch)
-            if frames == 0, b.mData != nil { frames = Int(b.mDataByteSize) / (MemoryLayout<Float>.size * ch) }
-        }
-        frames = min(frames, maxFrames)
+        let (count, frames) = gather(abl, into: refs)
         callbacks += 1
         guard frames > 0 else { level = 0; return }
         framesCaptured += frames
@@ -55,14 +60,16 @@ private final class OutputState {
     let l = UnsafeMutablePointer<Float>.allocate(capacity: maxFrames)
     let r = UnsafeMutablePointer<Float>.allocate(capacity: maxFrames)
     let refs = UnsafeMutablePointer<BufferRef>.allocate(capacity: maxBuffers)
+    let eq: ThreeBandEQ
     var level: Float = 0
     var callbacks = 0, framesRendered = 0
     /// Spatial placement: written from the UI thread, ramped across each block on the audio thread.
     var mixTarget = SpatialMix.identity
     private var mixNow = SpatialMix.identity
 
-    init(readers: [DelayReader]) {
+    init(readers: [DelayReader], sampleRate: Double) {
         self.readers = readers
+        eq = ThreeBandEQ(sampleRate: sampleRate)
         l.initialize(repeating: 0, count: maxFrames); r.initialize(repeating: 0, count: maxFrames)
         refs.initialize(repeating: BufferRef(data: nil, channels: 1), count: maxBuffers)
     }
@@ -72,15 +79,7 @@ private final class OutputState {
     func setGain(_ g: Float) { for rd in readers { rd.setGain(g) } }
 
     func process(_ abl: UnsafeMutableAudioBufferListPointer) {
-        let count = min(abl.count, maxBuffers)
-        var frames = 0
-        for i in 0..<count {
-            let b = abl[i]
-            let ch = max(1, Int(b.mNumberChannels))
-            refs[i] = BufferRef(data: b.mData?.assumingMemoryBound(to: Float.self), channels: ch)
-            if frames == 0, b.mData != nil { frames = Int(b.mDataByteSize) / (MemoryLayout<Float>.size * ch) }
-        }
-        frames = min(frames, maxFrames)
+        let (count, frames) = gather(abl, into: refs)
         callbacks += 1
         guard frames > 0 else { level = 0; return }
         framesRendered += frames
@@ -99,6 +98,7 @@ private final class OutputState {
                 r[i] = rl * a + rr * b
             }
         }
+        eq.process(l, r, frames: frames)
         var peak: Float = 0
         for i in 0..<frames {
             l[i] = max(-1, min(1, l[i])); r[i] = max(-1, min(1, r[i]))   // hard safety clip after summing inputs
@@ -120,7 +120,7 @@ protocol RingSource: AnyObject {
 /// Owns every IOProc. Create → `start()` → `stop()` (also on deinit).
 final class RouterEngine {
     private struct In { let device: AudioDeviceInfo; let io: DeviceIO; let state: InputState }
-    private struct Out { let device: AudioDeviceInfo; let io: DeviceIO; let state: OutputState }
+    private struct Out { let device: AudioDeviceInfo; let io: DeviceIO; let state: OutputState; let rate: Double }
     private var ins: [In] = []
     private var outs: [Out] = []
     /// Alternative to capturing an input device: audio arrives through the driver's shared memory (no mic indicator).
@@ -147,11 +147,11 @@ final class RouterEngine {
                 let rings = ins.map { $0.state.ring } + (shared.map { [$0.ring] } ?? [])
                 let readers = rings.map { DelayReader(ring: $0, outputSampleRate: rate, delayMs: delayMs) }
                 readers.forEach { $0.setGain(Float(volume)) }
-                let state = OutputState(readers: readers)
+                let state = OutputState(readers: readers, sampleRate: rate)
                 let block: AudioDeviceIOBlock = { _, _, _, outData, _ in
                     state.process(UnsafeMutableAudioBufferListPointer(outData))
                 }
-                outs.append(Out(device: d, io: try DeviceIO(deviceID: d.id, block: block), state: state))
+                outs.append(Out(device: d, io: try DeviceIO(deviceID: d.id, block: block), state: state, rate: rate))
                 } catch { failures.append((d.name, error.localizedDescription)) }
             }
             if outs.isEmpty, !outputs.isEmpty { throw IOError(message: failures.map { "\($0.name): \($0.message)" }.joined(separator: " · ")) }
@@ -208,6 +208,9 @@ final class RouterEngine {
 
     func setDelay(uid: String, ms: Double) { outs.first { $0.device.uid == uid }?.state.setDelay(ms: ms) }
     func setGain(uid: String, _ g: Float) { outs.first { $0.device.uid == uid }?.state.setGain(g) }
+    func setEQ(uid: String, _ e: EQSettings) { outs.first { $0.device.uid == uid }?.state.eq.set(e) }
+    /// Sample rate the engine drives this output at (what the router converts to).
+    func outputRate(uid: String) -> Double? { outs.first { $0.device.uid == uid }?.rate }
     func setMix(uid: String, _ m: SpatialMix) { outs.first { $0.device.uid == uid }?.state.mixTarget = m }
     func inputLevel(uid: String) -> Float { ins.first { $0.device.uid == uid }?.state.level ?? shared?.level ?? 0 }
     func outputLevel(uid: String) -> Float { outs.first { $0.device.uid == uid }?.state.level ?? 0 }

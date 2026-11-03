@@ -163,18 +163,18 @@ public enum DelayAI {
         return (best, bestJ)
     }
 
-    struct SplitMix {
+    public struct SplitMix {
         var s: UInt64
-        init(seed: UInt64) { s = seed }
-        mutating func next() -> UInt64 {
+        public init(seed: UInt64) { s = seed }
+        public mutating func next() -> UInt64 {
             s &+= 0x9E37_79B9_7F4A_7C15
             var z = s
             z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
             z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
             return z ^ (z >> 31)
         }
-        mutating func unit() -> Double { Double(next() >> 11) / Double(1 << 53) }
-        mutating func normal() -> Double {
+        public mutating func unit() -> Double { Double(next() >> 11) / Double(1 << 53) }
+        public mutating func normal() -> Double {
             let u1 = max(unit(), 1e-12), u2 = unit()
             return (-2 * log(u1)).squareRoot() * cos(2 * Double.pi * u2)
         }
@@ -205,7 +205,7 @@ final class SmoothMicModel {
     let lateSigma: Double, softSigma: Double
     let lateTable: [Double]
     let bandDbW: [Double]                      // per band: deconvolution weighting of the programme, in dB (0 without one)
-    static let lateWeight = RoomOptimizer.lateWeight
+    static var lateWeight: Double { RoomOptimizer.lateWeight }
 
     init?(_ mic: MicResponse, programme: Programme? = nil) {
         guard !mic.speakers.isEmpty, mic.speakers.allSatisfy({ $0 != nil }) else { return nil }

@@ -1,0 +1,20 @@
+#!/bin/bash
+# Controls a running (or not yet running) AdvancedMIO from the terminal, Shortcuts, Alfred, cron …
+#   amio start | stop | toggle | zero | open
+#   amio preset <name>        (name is matched case-insensitively; a prefix is enough)
+# It only sends an advancedmio:// URL — the app must be installed from scripts/bundle.sh (the URL scheme lives in its Info.plist).
+set -euo pipefail
+
+encode() { printf '%s' "$1" | xxd -p | tr -d '\n' | sed 's/../%&/g'; }
+
+usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+case "${1:-}" in
+    start|stop|toggle|zero|open) open -g "advancedmio://$1" ;;
+    preset)
+        [ $# -ge 2 ] || { echo "amio: preset needs a name" >&2; exit 2; }
+        shift
+        open -g "advancedmio://preset/$(encode "$*")" ;;
+    -h|--help|help|"") usage 0 ;;
+    *) echo "amio: unknown command '$1'" >&2; usage 2 ;;
+esac

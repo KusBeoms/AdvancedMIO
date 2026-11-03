@@ -301,4 +301,18 @@ extension CalibrationAnalysis {
         responses.filter { r in active.allSatisfy { $0 < r.speakers.count && r.speakers[$0] != nil } }
             .map { r in MicResponse(sampleRate: r.sampleRate, speakers: active.map { r.speakers[$0] }) }
     }
+
+    /// Per-speaker delays (ms, smallest = 0) that make every speaker's sound reach the microphone at the same moment:
+    /// `arrival` (seconds, the applied delay already removed) is averaged over the microphones. Delays above `maxDelayMs`
+    /// are capped. nil unless some microphone identified every speaker.
+    public static func alignedDelays(_ responses: [MicResponse], maxDelayMs: Double = 1000) -> [Double]? {
+        guard let n = responses.first?.speakers.count, n > 0 else { return nil }
+        let full = restrict(responses, to: Array(0..<n))
+        guard !full.isEmpty else { return nil }
+        let arrival = (0..<n).map { i in full.map { $0.speakers[i]!.arrival }.reduce(0, +) / Double(full.count) }
+        let latest = arrival.max() ?? 0
+        let d = arrival.map { min(maxDelayMs, max(0, (latest - $0) * 1000)) }
+        let low = d.min() ?? 0
+        return d.map { $0 - low }
+    }
 }

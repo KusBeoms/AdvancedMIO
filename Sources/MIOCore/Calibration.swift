@@ -216,7 +216,7 @@ public struct SlotSpec {
     }
 }
 
-public struct SpeakerIR {
+public struct SpeakerIR: Codable {
     public var h: [Double]               // starts `pre` samples before the onset, gain-normalised
     public var pre: Int
     /// Onset time of this speaker at the microphone, in the router's source timeline with the applied delay removed.
@@ -226,7 +226,7 @@ public struct SpeakerIR {
     public var consistency: Double       // correlation of the independent passes (1 when only one pass)
 }
 
-public struct MicResponse {
+public struct MicResponse: Codable {
     public var sampleRate: Double
     public var speakers: [SpeakerIR?]    // nil = speaker not heard by this microphone
     public init(sampleRate: Double, speakers: [SpeakerIR?]) { self.sampleRate = sampleRate; self.speakers = speakers }
@@ -646,7 +646,10 @@ public struct CalibrationOutcome {
 /// 8 kHz); the second is the share of energy arriving more than 50 ms after the first arrival (echo / reverb tail).
 /// Both are what we hear as "울림". The score is averaged over all microphones.
 public enum RoomOptimizer {
-    public static let lateWeight = 40.0
+    /// Weight of the late-energy term. 40 unless the listening test (developer page) has fitted another value; set it only
+    /// while no calibration is running.
+    public static let defaultLateWeight = 40.0
+    public nonisolated(unsafe) static var lateWeight = defaultLateWeight
     public static let minGain = 0.35
     static let earlyWindowSec = 0.05
 
@@ -697,13 +700,32 @@ public enum RoomOptimizer {
 
         /// (spectral variance in dB², late-energy ratio) for the given absolute delays (s) and gains.
         func score(delays: [Double], gains: [Double]) -> (Double, Double) {
+            guard let r = analyse(delays: delays, gains: gains) else { return (1e6, 1) }
+            let bands = r.bandDb.count
+            var sum = 0.0, sumSq = 0.0
+            for db in r.bandDb { sum += db; sumSq += db * db }
+            let mean = sum / Double(bands)
+            return (max(0, sumSq / Double(bands) - mean * mean), r.late)
+        }
+
+        /// Centre frequency (Hz) of each 1/6-octave band the score looks at.
+        var bandCentersHz: [Double] {
+            let binHz = fs / Double(nfft)
+            return (0..<(bandStart.count - 1)).map { b in
+                let lo = Double(k0 + bandStart[b]) * binHz, hi = Double(k0 + bandStart[b + 1]) * binHz
+                return (max(lo, 1) * max(hi, 1)).squareRoot()
+            }
+        }
+
+        /// Band powers (dB) of the summed response and the late-energy ratio; nil when the delays do not fit the scratch buffer.
+        func analyse(delays: [Double], gains: [Double]) -> (bandDb: [Double], late: Double)? {
             var T = [Double](repeating: 0, count: n)
             var t0 = Double.infinity
             for i in 0..<n { T[i] = arrival[i] + delays[i]; t0 = min(t0, T[i]) }
             var shifts = [Int](repeating: 0, count: n)
             var maxShift = 0
             for i in 0..<n { shifts[i] = Int(((T[i] - t0) * fs).rounded()); maxShift = max(maxShift, shifts[i]) }
-            guard len + maxShift <= scratch.count else { return (1e6, 1) }
+            guard len + maxShift <= scratch.count else { return nil }
 
             // Time domain: total and early energy of the summed IR.
             let total = len + maxShift
@@ -744,18 +766,39 @@ public enum RoomOptimizer {
                 }
             }
             for k in 0..<bins { pw[k] = re[k] * re[k] + im[k] * im[k] }
-            var sum = 0.0, sumSq = 0.0
             let bands = bandStart.count - 1
+            var out = [Double](repeating: 0, count: bands)
             for b in 0..<bands {
                 let a = bandStart[b], e = bandStart[b + 1]
                 var p = 0.0
                 for k in a..<e { p += pw[k] }
-                let db = 10 * log10(p / Double(e - a) + 1e-18)
-                sum += db; sumSq += db * db
+                out[b] = 10 * log10(p / Double(e - a) + 1e-18)
             }
-            let mean = sum / Double(bands)
-            return (max(0, sumSq / Double(bands) - mean * mean), late)
+            return (out, late)
         }
+    }
+
+    /// What the summed response of all speakers looks like at one microphone, for plotting.
+    public struct ResponseView {
+        public var centersHz: [Double]
+        /// Band level relative to the average band (dB): flat = no coloration.
+        public var deviationDb: [Double]
+        /// When each speaker's sound reaches the microphone, relative to the earliest (ms).
+        public var arrivalsMs: [Double]
+        /// Share of energy arriving more than 50 ms after the first sound (0…1).
+        public var late: Double
+    }
+
+    /// The response `mic` would have with these delays (ms) and unit gains. Nil if the microphone did not hear every speaker.
+    public static func view(of mic: MicResponse, delaysMs: [Double]) -> ResponseView? {
+        guard let m = MicModel(mic), delaysMs.count == m.n else { return nil }
+        let delays = delaysMs.map { $0 / 1000 }
+        guard let r = m.analyse(delays: delays, gains: [Double](repeating: 1, count: m.n)) else { return nil }
+        let mean = r.bandDb.reduce(0, +) / Double(r.bandDb.count)
+        let t = (0..<m.n).map { m.arrival[$0] + delays[$0] }
+        let t0 = t.min() ?? 0
+        return ResponseView(centersHz: m.bandCentersHz, deviationDb: r.bandDb.map { $0 - mean },
+                            arrivalsMs: t.map { ($0 - t0) * 1000 }, late: r.late)
     }
 
     /// Boominess index of a single measured response (e.g. all speakers together, as they really sounded).
