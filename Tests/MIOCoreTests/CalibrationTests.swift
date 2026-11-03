@@ -139,59 +139,6 @@ final class CalibrationTests: XCTestCase {
         XCTAssertNil(m.speakers[1])
     }
 
-    private func response(fs: Double, arrivals: [Double], directs: [Double], seeds: [UInt64]) -> MicResponse {
-        let pre = Int(0.001 * fs), len = Int(0.3 * fs)
-        let sp: [SpeakerIR?] = arrivals.indices.map { i in
-            var rng = LCG(s: seeds[i])
-            var h = [Double](repeating: 0, count: pre + len)
-            h[pre] = directs[i]
-            for t in (pre + Int(0.004 * fs))..<h.count { h[t] = 0.08 * rng.next() * exp(-Double(t - pre) / (0.08 * fs)) }
-            return SpeakerIR(h: h, pre: pre, arrival: arrivals[i], snr: 100, consistency: 1)
-        }
-        return MicResponse(sampleRate: fs, speakers: sp)
-    }
-
-    func testOptimizerAlignsSpeakersAndImprovesScore() {
-        let fs = 8000.0
-        // Speaker 1 is 12 ms further from the microphone → arrives later; with equal delays the two comb-filter.
-        let mic = response(fs: fs, arrivals: [0.010, 0.022], directs: [1.0, 0.9], seeds: [11, 12])
-        let out = RoomOptimizer.optimize(mics: [mic], baselineDelaysMs: [0, 0], baselineGains: [1, 1])!
-        XCTAssertLessThan(out.scoreAfter, out.scoreBefore)
-        XCTAssertGreaterThan(out.improvement, 0.1)
-        XCTAssertEqual(out.delaysMs[0] - out.delaysMs[1], 12, accuracy: 3)     // the nearer speaker is held back
-        XCTAssertEqual(out.delaysMs.min()!, 0, accuracy: 1e-9)
-        XCTAssertTrue(out.gains.allSatisfy { $0 >= RoomOptimizer.minGain && $0 <= 1 })
-    }
-
-    func testOptimizerNeverWorsensAnAlreadyGoodSetting() {
-        let fs = 8000.0
-        let mic = response(fs: fs, arrivals: [0.010, 0.022], directs: [1.0, 0.9], seeds: [11, 12])
-        let first = RoomOptimizer.optimize(mics: [mic], baselineDelaysMs: [0, 0], baselineGains: [1, 1])!
-        let again = RoomOptimizer.optimize(mics: [mic], baselineDelaysMs: first.delaysMs, baselineGains: first.gains)!
-        XCTAssertLessThanOrEqual(again.scoreAfter, again.scoreBefore + 1e-9)
-        XCTAssertLessThan(abs(again.scoreAfter - first.scoreAfter), 0.5)
-    }
-
-    func testOptimizerKeepsUserGainsWhenAskedTo() {
-        let fs = 8000.0
-        let mic = response(fs: fs, arrivals: [0.010, 0.022], directs: [1.0, 0.9], seeds: [11, 12])
-        let out = RoomOptimizer.optimize(mics: [mic], baselineDelaysMs: [0, 0], baselineGains: [1.7, 0.2], optimizeGains: false)!
-        XCTAssertEqual(out.gains, [1.7, 0.2])
-        XCTAssertLessThan(out.scoreAfter, out.scoreBefore)
-        XCTAssertEqual(out.delaysMs[0] - out.delaysMs[1], 12, accuracy: 3)
-    }
-
-    func testOptimizerUsesAllMicrophones() {
-        let fs = 8000.0
-        let a = response(fs: fs, arrivals: [0.010, 0.022], directs: [1.0, 0.9], seeds: [11, 12])
-        let b = response(fs: fs, arrivals: [0.012, 0.020], directs: [0.9, 1.0], seeds: [13, 14])
-        let out = RoomOptimizer.optimize(mics: [a, b], baselineDelaysMs: [0, 0], baselineGains: [1, 1])!
-        XCTAssertEqual(out.micScoresBefore.count, 2)
-        XCTAssertLessThan(out.scoreAfter, out.scoreBefore)
-        XCTAssertNil(RoomOptimizer.optimize(mics: [MicResponse(sampleRate: fs, speakers: [nil, nil])],
-                                            baselineDelaysMs: [0, 0], baselineGains: [1, 1]))
-    }
-
     // MARK: Simultaneous (joint) measurement
 
     /// Colour noise standing in for music: low-passed white noise with a slow envelope.
@@ -324,37 +271,5 @@ final class CalibrationTests: XCTestCase {
         let s = try! XCTUnwrap(VolumeBalance.suggest(power: [[1, 1], [1, 1], [1, 1]]))
         XCTAssertTrue(s.gainsDb.allSatisfy { abs($0) < 0.51 })
         XCTAssertLessThan(s.spreadBeforeDb, 0.01)
-    }
-
-    /// A model whose speaker 1 arrival is 9 ms off; the measured combined response has it where it really is.
-    func testModelRefinerFindsAMisTimedSpeakerAndLeavesTheCorrectOnesAlone() throws {
-        let fs = 8000.0
-        func model(_ arrivals: [Double]) -> MicResponse {
-            let pre = max(1, Int(0.001 * fs)), len = Int(0.2 * fs)
-            return MicResponse(sampleRate: fs, speakers: arrivals.enumerated().map { i, a in
-                var h = [Double](repeating: 0, count: pre + len)
-                h[pre] = 1.0; h[pre + 1] = -0.5 + 0.1 * Double(i); h[pre + 2] = 0.3
-                return SpeakerIR(h: h, pre: pre, arrival: a, snr: 100, consistency: 1)
-            })
-        }
-        let truth = model([0.030, 0.071, 0.120]), assumed = model([0.030, 0.062, 0.120])
-        let delays = [40.0, 0.0, 15.0]
-        let n = 8192, pad = 800
-        var ir = [Float](repeating: 0, count: pad + n)
-        var rng = LCG(s: 4)
-        for (i, sp) in truth.speakers.enumerated() {
-            let start = pad + Int(((sp!.arrival + delays[i] / 1000) * fs).rounded()) - sp!.pre
-            for (j, v) in sp!.h.prefix(sp!.pre + 80).enumerated() { ir[start + j] += Float(v) }
-        }
-        for t in 0..<ir.count { ir[t] += Float(0.02 * rng.next()) }           // noise / tails
-        let obs = [Observation(mic: 0, delaysMs: delays, ir: ir, pad: pad)]
-        let e = try XCTUnwrap(ModelRefiner.estimate(model: [assumed], observations: obs))
-        XCTAssertEqual(e.biasMs[1], 9, accuracy: 0.6)
-        XCTAssertEqual(e.biasMs[0], 0, accuracy: 0.3)
-        XCTAssertEqual(e.biasMs[2], 0, accuracy: 0.3)
-        XCTAssertLessThan(e.costAfter, e.costZero)
-        // A correct model: no correction.
-        let ok = try XCTUnwrap(ModelRefiner.estimate(model: [truth], observations: obs))
-        XCTAssertTrue(ok.biasMs.allSatisfy { abs($0) < 0.3 })
     }
 }

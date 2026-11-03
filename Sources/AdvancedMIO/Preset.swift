@@ -20,7 +20,7 @@ struct CalibrationRecord: Codable, Identifiable, Equatable {
     var calibratedDelaysMs: [Double]
     var measuredBefore: Double?
     var measuredAfter: Double?
-    /// What `measuredBefore/After` are: "ms" = spread of the speakers' arrival times; nil = the old boominess index.
+    /// What `measuredBefore/After` are: "ms" = spread of the speakers' arrival times at the microphone; nil = an old record from the earlier boominess-index method.
     var unit: String?
     /// Hardware-reported latency of each speaker at the time (to notice Bluetooth devices drifting later).
     var hwLatencyMs: [String: Double]

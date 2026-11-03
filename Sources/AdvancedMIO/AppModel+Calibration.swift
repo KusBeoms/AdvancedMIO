@@ -1,32 +1,29 @@
 import Foundation
 import MIOCore
 
-/// What the result screen plots: the summed response at the microphone with the original and the calibrated delays.
+/// What the result screen plots: when each speaker's sound reaches the microphone, with the old and the new delays.
 struct CalibrationCharts {
-    let names: [String]                         // the speakers the microphone heard
-    let before: RoomOptimizer.ResponseView
-    let after: RoomOptimizer.ResponseView
+    let names: [String]
+    let beforeMs: [Double]        // relative to the earliest speaker
+    let afterMs: [Double]
 }
 
 extension CalibrationReport {
-    /// Speakers the microphone heard (the identified room only contains these), in speaker order.
-    var audibleIndices: [Int] { speakerNames.indices.filter { !excluded.contains(speakerNames[$0]) } }
-
     func charts() -> CalibrationCharts? {
-        guard let mic = room.first else { return nil }
-        let idx = audibleIndices
-        guard !idx.isEmpty, idx.allSatisfy({ $0 < originalDelaysMs.count && $0 < outcome.delaysMs.count }),
-              let b = RoomOptimizer.view(of: mic, delaysMs: idx.map { originalDelaysMs[$0] }),
-              let a = RoomOptimizer.view(of: mic, delaysMs: idx.map { outcome.delaysMs[$0] }) else { return nil }
-        return CalibrationCharts(names: idx.map { speakerNames[$0] }, before: b, after: a)
+        let n = speakerNames.count
+        guard n > 0, arrivalsMs.count == n, originalDelaysMs.count == n, delaysMs.count == n else { return nil }
+        func rel(_ d: [Double]) -> [Double] {
+            let t = (0..<n).map { arrivalsMs[$0] + d[$0] }
+            let low = t.min() ?? 0
+            return t.map { $0 - low }
+        }
+        return CalibrationCharts(names: speakerNames, beforeMs: rel(originalDelaysMs), afterMs: rel(delaysMs))
     }
 
     /// Why this result can or cannot be trusted, in plain words.
     var confidenceNotes: [String] {
         var notes: [String] = []
-        if let b = measuredBefore, let a = measuredAfter {
-            notes.append("스피커 사이 도착 시간 차이 \(String(format: "%.1f", b)) ms → \(String(format: "%.1f", a)) ms (마이크 위치 기준, 측정 모델로 계산)")
-        }
+        notes.append(wholeSong ? "노래 전체를 \(segments)개 구간으로 나눠 한 번에 계산했습니다" : "빠른 측정: 음량 패턴 \(segments)개 구간으로 계산했습니다 (곡 전체를 쓰면 더 정확합니다)")
         if let f = fit {
             notes.append("수식 모델이 녹음의 \(Int((f * 100).rounded()))%를 설명 — \(f < 0.5 ? "낮아서 도착 시간이 덜 정확할 수 있습니다" : "충분히 높습니다")")
         }
@@ -41,7 +38,7 @@ extension AppModel {
 
     var calSpeakers: [AudioDeviceInfo] { enabledOutputs }
     var canCalibrate: Bool { !demo && calPhase == .idle && calSpeakers.count >= 2 && !micDevices.isEmpty }
-    var calEstimate: Double { CalibrationRunner.estimatedSeconds(speakers: calSpeakers.count, mics: max(1, calMics.count)) }
+    var calEstimate: Double { CalibrationRunner.estimatedSeconds(speakers: calSpeakers.count, mics: max(1, calMics.count), wholeSong: calWholeSong) }
 
     /// Opens the setup window: the test song plays through every enabled speaker so the volumes can be balanced by ear.
     func openCalibration() {
@@ -73,13 +70,6 @@ extension AppModel {
     func calStartFresh() { for d in calSpeakers { setDeviceVolume(d.uid, 0.5) } }
     var calVolumesChanged: Bool { calSpeakers.contains { abs(deviceVolume($0.uid) - (presetVolumes[$0.uid] ?? 1)) > 0.005 } }
 
-    /// "Finish now": stop measuring after the current measurement and use the best setting found so far.
-    func finishCalibrationEarly() {
-        guard calPhase == .running, calControl.searching else { return }
-        calControl.requestFinish()
-        calFinishRequested = true
-    }
-
     func closeCalibration() {
         calTask?.cancel(); calTask = nil
         testEngine?.stop(); testEngine = nil
@@ -104,25 +94,20 @@ extension AppModel {
             calPhase = .running
             let speakers = calSpeakers.map { CalibrationSpeaker(device: $0, appliedDelayMs: syncDelayMs($0.uid), volume: digitalVolume($0.uid)) }
             let mics = Array(micDevices.filter { calMics.contains($0.uid) }.prefix(1))
-            let control = CalibrationControl()
-            calControl = control
             calStarted = Date()
-            calBestSoFar = nil; calCanFinishEarly = false; calFinishRequested = false; calRemaining = calEstimate
-            let estimate = CalibrationRunner.estimatedSeconds(speakers: speakers.count, mics: mics.count)
+            calRemaining = calEstimate
+            let estimate = calEstimate
             do {
-                let report = try await CalibrationRunner().run(speakers: speakers, mics: mics, control: control) { [weak self] text, frac in
+                let report = try await CalibrationRunner().run(speakers: speakers, mics: mics, wholeSong: calWholeSong) { [weak self] text, frac in
                     Task { @MainActor in
                         guard let self else { return }
                         self.calStatus = text; self.calFraction = frac
                         let left = estimate - Date().timeIntervalSince(self.calStarted)
                         self.calRemaining = left > 3 ? left : nil
-                        self.calBestSoFar = control.improvement
-                        self.calCanFinishEarly = control.searching
                     }
                 }
                 calReport = report
                 calCharts = report.charts()
-                if let room = report.room.first { Task.detached(priority: .utility) { DevStore.saveRoom(room) } }
                 recordCalibration(report)
                 stopListening()
                 calPhase = .done
@@ -137,7 +122,7 @@ extension AppModel {
     /// Makes the solved delays the current setting. Volumes are left exactly as the user set them.
     func applyCalibration() {
         guard let r = calReport else { return }
-        let delays = r.outcome.delaysMs
+        let delays = r.delaysMs
         // Slider values are absolute lags; the router delays every speaker to the laggiest one, so lag_i = M − delay_i.
         let m = max(delays.max() ?? 0, calSpeakers.map { totalLag($0.uid) }.max() ?? 0)
         for (i, uid) in r.speakerUIDs.enumerated() where i < delays.count {
@@ -163,7 +148,7 @@ extension AppModel {
     /// Plays the test song through the speakers with the original (false) or the calibrated (true) delays, switching live.
     func calListen(calibrated: Bool) {
         guard let r = calReport else { return }
-        let delays = calibrated ? r.outcome.delaysMs : r.originalDelaysMs
+        let delays = calibrated ? r.delaysMs : r.originalDelaysMs
         if let e = testEngine {
             for (i, uid) in r.speakerUIDs.enumerated() where i < delays.count { e.setDelay(uid: uid, ms: delays[i]) }
             calListening = calibrated
@@ -192,7 +177,7 @@ extension AppModel {
     func recordFeedback(better: String) {
         guard let r = calReport else { return }
         var log = UserDefaults.standard.array(forKey: "calibration.feedback") as? [[String: Any]] ?? []
-        log.append(["better": better, "measured": r.measuredImprovement ?? NSNull(), "date": Date().timeIntervalSince1970])
+        log.append(["better": better, "measured": r.improvement ?? NSNull(), "date": Date().timeIntervalSince1970])
         UserDefaults.standard.set(log, forKey: "calibration.feedback")
         calFeedbackGiven = true
     }
@@ -212,8 +197,8 @@ extension AppModel {
 
     private func recordCalibration(_ r: CalibrationReport) {
         let rec = CalibrationRecord(date: Date(), roomName: calRoomName, speakerUIDs: r.speakerUIDs, speakerNames: r.speakerNames,
-                                    originalDelaysMs: r.originalDelaysMs, calibratedDelaysMs: r.outcome.delaysMs,
-                                    measuredBefore: r.measuredBefore, measuredAfter: r.measuredAfter, unit: "ms",
+                                    originalDelaysMs: r.originalDelaysMs, calibratedDelaysMs: r.delaysMs,
+                                    measuredBefore: r.spreadBeforeMs, measuredAfter: r.spreadAfterMs, unit: "ms",
                                     hwLatencyMs: hwLatencyMs.filter { r.speakerUIDs.contains($0.key) }, applied: false)
         calRecordID = rec.id
         calHistory.append(rec)

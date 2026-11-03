@@ -1,11 +1,9 @@
 import SwiftUI
 
-enum SideTab { case source, spatial, dev }
+enum SideTab { case source, spatial }
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
-    @StateObject private var lab = DevLab()
-    @StateObject private var resonance = ResonanceLab()
     @State private var showHistory = false
     @State private var presetNameDraft = ""
     @State private var askPresetName = false
@@ -20,7 +18,7 @@ struct ContentView: View {
                 ForEach(model.latencyAlerts) { latencyBanner($0) }
                 HStack(alignment: .top, spacing: 18) {
                     sourceColumn.frame(width: 300)
-                    if sideTab == .dev { DevPage().environmentObject(model).environmentObject(lab).environmentObject(resonance) } else { outputsColumn }
+                    outputsColumn
                 }
                 .padding(.horizontal, 22)
                 .padding(.bottom, 14)
@@ -30,7 +28,6 @@ struct ContentView: View {
         .foregroundStyle(.white)
         .preferredColorScheme(.dark)
         .frame(minWidth: 980, minHeight: 620)
-        .onChange(of: sideTab) { if $0 != .dev { lab.stop(); resonance.stop() } }
         .sheet(isPresented: Binding(get: { model.calPhase != .idle }, set: { if !$0 { model.closeCalibration() } })) {
             CalibrationSheet().environmentObject(model)
         }
@@ -161,7 +158,6 @@ struct ContentView: View {
             HStack(spacing: 6) {
                 sideTabButton(.source, "SOURCE")
                 sideTabButton(.spatial, "공간음향")
-                sideTabButton(.dev, "개발자 모드")
                 Spacer()
                 if model.spatialOn { Text("ON").font(.system(size: 10, weight: .bold)).foregroundStyle(Theme.cyan) }
             }
@@ -169,7 +165,6 @@ struct ContentView: View {
             switch sideTab {
             case .source: SourceCard().environmentObject(model)
             case .spatial: SpatialCard().environmentObject(model)
-            case .dev: DevSummaryCard().environmentObject(lab)
             }
             Spacer(minLength: 0)
         }

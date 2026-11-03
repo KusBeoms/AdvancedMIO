@@ -66,18 +66,16 @@ final class AppModel: ObservableObject {
     /// Seconds left according to the estimate (nil once it is overrun: "wrapping up").
     @Published var calRemaining: Double?
     /// Best measured improvement so far while the search runs (0…1).
-    @Published var calBestSoFar: Double?
     /// The search has started, so "finish now with the best so far" makes sense.
-    @Published var calCanFinishEarly = false
-    @Published var calFinishRequested = false
     @Published var calListening: Bool?        // nil = not playing, false = original, true = calibrated
     @Published var calFeedbackGiven = false
+    /// Measure with the whole song (true) or one quick round of volume patterns (about 30 s).
+    @Published var calWholeSong = true
     @Published var calCharts: CalibrationCharts?
     @Published var calHistory: [CalibrationRecord] = []
     @Published var calRoomName = UserDefaults.standard.string(forKey: "calibration.roomName") ?? "내 방"
     var calRecordID: UUID?
     var calTask: Task<Void, Never>?
-    var calControl = CalibrationControl()
     var calStarted = Date()
     var testEngine: RouterEngine?
     var presetVolumes: [String: Double] = [:]
@@ -109,7 +107,6 @@ final class AppModel: ObservableObject {
     // MARK: Init
 
     init() {
-        DevStore.applySavedWeight()
         if CommandLine.arguments.contains("--demo") { loadDemo(); return }
         if let d = UserDefaults.standard.data(forKey: "state.v1"),
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
