@@ -55,6 +55,12 @@ extension AppModel {
         updateLatencyAlerts()
     }
 
+    func setReportsLatencyToOS(_ on: Bool) {
+        reportsLatencyToOS = on
+        UserDefaults.standard.set(on, forKey: "reportLatencyToOS")
+        publishReportedLatency()
+    }
+
     func setLatencyWarnings(_ on: Bool) {
         latencyWarningsEnabled = on
         UserDefaults.standard.set(on, forKey: "latencyWarnings")

@@ -34,21 +34,37 @@ final class SharedRingSource: RingSource {
     private var writeEnd: Int64 { base.load(fromByteOffset: 16, as: Int64.self) }
 
     static func open() -> SharedRingSource? {
-        let fd = c_shm_open(name, O_RDONLY)
+        // Read-write when the driver allows it (it sets 0666): the app also writes the latency it wants reported.
+        var writable = true
+        var fd = c_shm_open(name, O_RDWR)
+        if fd < 0 { writable = false; fd = c_shm_open(name, O_RDONLY) }
         guard fd >= 0 else { return nil }
         defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0, st.st_size >= MemoryLayout<Header>.size else { return nil }
         let size = Int(st.st_size)
-        guard let m = mmap(nil, size, PROT_READ, MAP_SHARED, fd, 0), m != MAP_FAILED else { return nil }
+        guard let m = mmap(nil, size, writable ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, fd, 0), m != MAP_FAILED
+        else { return nil }
         let h = m.load(as: Header.self)
         guard h.magic == magic, h.version == 1, h.ringFrames > 0, h.ringFrames & (h.ringFrames - 1) == 0,
               size >= MemoryLayout<Header>.size + Int(h.ringFrames) * channels * 4 else { munmap(m, size); return nil }
-        return SharedRingSource(base: m, size: size, header: h)
+        // An older driver has no latency slot after the data: then there is nothing to report to.
+        let slot = MemoryLayout<Header>.size + Int(h.ringFrames) * channels * 4
+        let hasLatencySlot = writable && size >= slot + MemoryLayout<UInt32>.size
+        return SharedRingSource(base: m, size: size, header: h, latencyOffset: hasLatencySlot ? slot : nil)
     }
 
-    private init(base: UnsafeMutableRawPointer, size: Int, header: Header) {
-        self.base = base; mapSize = size
+    /// Byte offset of the driver's "reported latency" field, nil when the driver is too old or the memory is read-only.
+    private let latencyOffset: Int?
+
+    /// Tells the driver how many frames of delay to report to macOS as the virtual device's output latency.
+    func setReportedLatency(frames: UInt32) {
+        guard let o = latencyOffset else { return }
+        base.storeBytes(of: frames, toByteOffset: o, as: UInt32.self)
+    }
+
+    private init(base: UnsafeMutableRawPointer, size: Int, header: Header, latencyOffset: Int?) {
+        self.base = base; mapSize = size; self.latencyOffset = latencyOffset
         ringFrames = Int(header.ringFrames)
         data = UnsafePointer((base + 24).assumingMemoryBound(to: Float.self))   // header is 24 bytes (4×u32 + i64, aligned)
         ring = StereoRing(sampleRate: Double(header.sampleRate))

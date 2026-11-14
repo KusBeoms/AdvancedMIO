@@ -52,6 +52,8 @@ final class AppModel: ObservableObject {
     // Latency watch (see AppModel+Latency).
     @Published var latencyAlerts: [LatencyAlert] = []
     @Published var latencyWarningsEnabled = true
+    /// Report the router's delay to macOS as the AdvancedMIO device's output latency (see publishReportedLatency).
+    @Published var reportsLatencyToOS = true
     var dismissedLatency: [String: Double] = [:]
 
     // Calibration (see AppModel+Calibration / CalibrationRunner / CalibrationView)
@@ -90,7 +92,7 @@ final class AppModel: ObservableObject {
     private static let idleGrace: TimeInterval = 3
     private var listenerBlock: AudioObjectPropertyListenerBlock?
     /// Audio from the driver's shared memory (no microphone indicator). nil → older driver, falls back to capturing the input.
-    private var shared: SharedRingSource?
+    fileprivate(set) var shared: SharedRingSource?
     var demo = false
 
     // MARK: Derived
@@ -118,8 +120,13 @@ final class AppModel: ObservableObject {
         calHistory = Store.loadHistory()
         activePresetID = UserDefaults.standard.string(forKey: "presets.active").flatMap(UUID.init)
         latencyWarningsEnabled = UserDefaults.standard.object(forKey: "latencyWarnings") as? Bool ?? true
+        reportsLatencyToOS = UserDefaults.standard.object(forKey: "reportLatencyToOS") as? Bool ?? true
         refresh()
         installDeviceListener()
+        // Don't leave a stale latency behind in the driver once the app is gone.
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { AppModel.shared.shared?.setReportedLatency(frames: 0) }
+        }
         hwTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.slowTick() }
         }
@@ -312,6 +319,17 @@ final class AppModel: ObservableObject {
             for d in enabledOutputs { e.setDelay(uid: d.uid, ms: appliedDelayMs(d.uid)) }
         }
         pushMixes()     // placements change whenever the set of enabled outputs does (default slots)
+        publishReportedLatency()
+    }
+
+    /// Tells the driver (via shared memory) the delay macOS should assume for the AdvancedMIO device: the laggiest enabled
+    /// output, so players hold video back by the same amount. 0 while routing is off or the setting is switched off.
+    func publishReportedLatency() {
+        guard !demo, let shared else { return }
+        let frames: UInt32 = reportsLatencyToOS && running
+            ? LagMath.reportedLatencyFrames(lagsMs: enabledOutputs.map { totalLag($0.uid) }, sampleRate: sourceRate ?? 48000)
+            : 0
+        shared.setReportedLatency(frames: frames)
     }
 
     /// The calibration test engine is left alone: it must measure the plain signal.
@@ -363,17 +381,19 @@ final class AppModel: ObservableObject {
             MainActor.assumeIsolated { self?.tick() }
         }
         tick()
+        publishReportedLatency()
     }
 
     func disarm() {
         pollTimer?.invalidate(); pollTimer = nil
         running = false
         stopEngine()
+        publishReportedLatency()
     }
 
     func tick() {
         guard running, calPhase == .idle else { return }
-        if shared == nil { shared = SharedRingSource.open() }
+        if shared == nil { shared = SharedRingSource.open(); publishReportedLatency() }
         // Shared memory: audio is flowing when the driver's write position moved. Otherwise ask the driver how many
         // clients play; an older driver without that counter means we simply always capture.
         let playing: Bool

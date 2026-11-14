@@ -75,6 +75,7 @@ struct ContentView: View {
     private var settingsMenu: some View {
         Menu {
             Toggle("지연 변화 경고 표시", isOn: Binding(get: { model.latencyWarningsEnabled }, set: { model.setLatencyWarnings($0) }))
+            Toggle("macOS에 지연 시간 알리기", isOn: Binding(get: { model.reportsLatencyToOS }, set: { model.setReportsLatencyToOS($0) }))
             Toggle("전역 단축키 (⌃⌥⌘ S · Z · 1–9)", isOn: Binding(get: { model.hotkeysEnabled }, set: { model.setHotkeys($0) }))
             Toggle("로그인 시 자동 실행", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
         } label: {

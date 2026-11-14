@@ -9,6 +9,16 @@ final class RoutingLogicTests: XCTestCase {
         XCTAssertEqual(LagMath.shiftedToZero([]), [])
     }
 
+    func testReportedLatencyIsTheLaggiestOutput() {
+        XCTAssertEqual(LagMath.reportedLatencyFrames(lagsMs: [292, 150, 80], sampleRate: 48000), 14016)
+        XCTAssertEqual(LagMath.reportedLatencyFrames(lagsMs: [100], sampleRate: 44100), 4410)
+        XCTAssertEqual(LagMath.reportedLatencyFrames(lagsMs: [], sampleRate: 48000), 0)
+        XCTAssertEqual(LagMath.reportedLatencyFrames(lagsMs: [-5, 0], sampleRate: 48000), 0)
+        XCTAssertEqual(LagMath.reportedLatencyFrames(lagsMs: [.nan, 20], sampleRate: 48000), 960)
+        XCTAssertEqual(LagMath.reportedLatencyFrames(lagsMs: [5000], sampleRate: 48000), 48000)   // capped at maxDelayMs
+        XCTAssertEqual(LagMath.reportedLatencyFrames(lagsMs: [100], sampleRate: 0), 0)
+    }
+
     func testLatencyDriftThreshold() {
         XCTAssertFalse(LatencyWatch.hasDrifted(from: 190, to: 205))     // 15 ms: below 20 ms and below 15 % (28.5)
         XCTAssertTrue(LatencyWatch.hasDrifted(from: 190, to: 230))      // 40 ms

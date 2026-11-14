@@ -6,6 +6,7 @@
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <fcntl.h>
@@ -60,6 +61,10 @@ typedef struct {
     uint32_t magic, version, sampleRate, ringFrames;
     volatile int64_t writeEnd;      // sample time just past the newest frame
     Float32 data[kRingFrames * kChannels];
+    // Appended after `data` so the header / data offsets older apps rely on stay put. Written by the app: the frames of
+    // delay between playing to this device and hearing it (laggiest real output). Reported to macOS as the output latency
+    // so players can hold video back to match. 0 = unknown / not reporting.
+    volatile uint32_t reportedLatencyFrames;
 } SharedRing;
 static SharedRing *gShared = NULL;
 
@@ -75,8 +80,17 @@ static void OpenSharedRing(void) {
     SharedRing *r = m;
     r->version = 1; r->sampleRate = (uint32_t)kSampleRate; r->ringFrames = kRingFrames;
     __atomic_store_n(&r->writeEnd, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&r->reportedLatencyFrames, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&r->magic, kShmMagic, __ATOMIC_RELEASE);
     gShared = r;
+}
+
+// Latency the app asked us to report (frames), capped so a stray write can't advertise something absurd.
+static UInt32 ReportedLatencyFrames(void) {
+    if (!gShared) return 0;
+    UInt32 f = __atomic_load_n(&gShared->reportedLatencyFrames, __ATOMIC_ACQUIRE);
+    UInt32 cap = (UInt32)kSampleRate;       // 1 s, same as the app's maximum delay
+    return f > cap ? cap : f;
 }
 
 // MARK: - Helpers
@@ -107,10 +121,31 @@ static bool IsOurClient(UInt32 id) {       // call with gMutex held
     return false;
 }
 
-static void NotifyChanged(AudioObjectID obj, AudioObjectPropertySelector sel) {
+static void NotifyChangedScoped(AudioObjectID obj, AudioObjectPropertySelector sel, AudioObjectPropertyScope scope) {
     if (!gHost) return;
-    AudioObjectPropertyAddress a = { sel, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectPropertyAddress a = { sel, scope, kAudioObjectPropertyElementMain };
     gHost->PropertiesChanged(gHost, obj, 1, &a);
+}
+static void NotifyChanged(AudioObjectID obj, AudioObjectPropertySelector sel) {
+    NotifyChangedScoped(obj, sel, kAudioObjectPropertyScopeGlobal);
+}
+
+// The app updates the reported latency through shared memory, so a background timer (never the IO thread) notices the
+// change and tells the HAL, which then re-reads kAudioDevicePropertyLatency.
+static dispatch_source_t gLatencyTimer = NULL;
+static UInt32 gLastReportedLatency = 0;
+static void StartLatencyWatch(void) {
+    if (gLatencyTimer) return;
+    gLatencyTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    if (!gLatencyTimer) return;
+    dispatch_source_set_timer(gLatencyTimer, dispatch_time(DISPATCH_TIME_NOW, 0), 500 * NSEC_PER_MSEC, 100 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(gLatencyTimer, ^{
+        UInt32 now = ReportedLatencyFrames();
+        if (now == gLastReportedLatency) return;
+        gLastReportedLatency = now;
+        NotifyChangedScoped(kObj_Device, kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput);
+    });
+    dispatch_resume(gLatencyTimer);
 }
 
 // Property reply helpers. `out == NULL` means "size query only".
@@ -198,7 +233,8 @@ static OSStatus Property(AudioObjectID obj, const AudioObjectPropertyAddress *a,
             RET_VALUE(UInt32, a->mScope == kAudioObjectPropertyScopeOutput ? 1 : 0);   // output only: never the default mic
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
             RET_VALUE(UInt32, a->mScope == kAudioObjectPropertyScopeOutput ? 1 : 0);
-        case kAudioDevicePropertyLatency:       RET_VALUE(UInt32, 0);
+        case kAudioDevicePropertyLatency:       // output side only: the capture (loopback) side stays 0
+            RET_VALUE(UInt32, a->mScope == kAudioObjectPropertyScopeOutput ? ReportedLatencyFrames() : 0);
         case kAudioDevicePropertySafetyOffset:  RET_VALUE(UInt32, 0);
         case kAudioDevicePropertyIsHidden:      RET_VALUE(UInt32, 0);
         case kAudioDevicePropertyZeroTimeStampPeriod: RET_VALUE(UInt32, kRingFrames);
@@ -291,6 +327,7 @@ static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRe
     Float64 ticksPerSecond = 1e9 * (Float64)tb.denom / (Float64)tb.numer;
     gHostTicksPerFrame = ticksPerSecond / kSampleRate;
     OpenSharedRing();
+    StartLatencyWatch();
     return kAudioHardwareNoError;
 }
 

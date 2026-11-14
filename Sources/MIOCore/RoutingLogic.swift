@@ -8,6 +8,15 @@ public enum LagMath {
         guard let lo = lags.min() else { return lags }
         return lags.map { max(0, $0 - lo) }
     }
+
+    /// The latency the virtual device tells macOS about, in frames: the laggiest output, since every other output is
+    /// delayed to land with it. Negative / non-finite values count as 0; the top is `DelayReader.maxDelayMs`.
+    public static func reportedLatencyFrames(lagsMs: [Double], sampleRate: Double) -> UInt32 {
+        guard sampleRate.isFinite, sampleRate > 0 else { return 0 }
+        let worst = lagsMs.filter(\.isFinite).max() ?? 0
+        let ms = min(DelayReader.maxDelayMs, max(0, worst))
+        return UInt32((ms / 1000 * sampleRate).rounded())
+    }
 }
 
 public enum LatencyWatch {
