@@ -69,6 +69,27 @@ final class DelayReaderTests: XCTestCase {
         XCTAssertTrue(sim.out.allSatisfy { $0 == 0 })
     }
 
+    /// Regression: after the writer stops, a delayed reader plays out what was already written once, then falls silent
+    /// (it used to hop back into the stale ring and loop the last moments), and it locks again when writes resume.
+    func testStoppedWriterPlaysTailOnceThenSilenceAndResumes() {
+        for ms in [0.0, 150, 300, 800] {
+            var sim = Sim(delayMs: ms, signal: { _ in 0.5 })
+            sim.run(seconds: 1)
+            let start = sim.out.count
+            for _ in 0..<200 { sim.readBlock(512) }          // ≈ 2 s with no writes
+            let after = Array(sim.out[start...])
+            let audible = after.filter { $0 != 0 }.count
+            XCTAssertLessThanOrEqual(Double(audible), (ms / 1000 + 0.15) * 48000, "delay \(ms) ms replayed stale audio")
+            if ms >= 300 { XCTAssertGreaterThan(audible, Int(0.5 * ms / 1000 * 48000), "delay \(ms) ms lost its tail") }
+            XCTAssertTrue(after.suffix(24000).allSatisfy { $0 == 0 }, "delay \(ms) ms still playing after 2 s")
+
+            sim.inTime = sim.outTime                         // writer comes back
+            let resume = sim.out.count
+            sim.run(seconds: 2)
+            XCTAssertTrue(sim.out[resume...].contains { $0 != 0 }, "delay \(ms) ms never resumed")
+        }
+    }
+
     func testZeroDelayHasSmallLatency() {
         var sim = Sim(delayMs: 0)
         sim.run(seconds: 1)

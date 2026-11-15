@@ -15,6 +15,9 @@ public final class DelayReader {
 
     // Audio-thread state.
     private var primed = false
+    /// Write index at the last underrun: re-priming is refused until the writer has moved past it, so a stopped source
+    /// can never be re-locked into its stale ring contents (which replayed the last moments in a loop).
+    private var primeBlockedW = -1
     private var readPos: Double = 0
     private var oldPos: Double = 0
     private var xfadeLeft = 0
@@ -120,16 +123,19 @@ public final class DelayReader {
             }
 
             if !primed {
-                guard Double(w) >= desired else { return }
+                guard Double(w) >= desired, w != primeBlockedW else { return }
                 readPos = wNow - desired
                 xfadeLeft = 0
                 primed = true
                 startTracking()
             }
 
+            // Writer silent (stopped/paused): never hop/resync toward its frozen position — that jumps back into old audio.
+            // Just play out what was already written; the underrun check below then falls silent.
+            let writerStalled = now - lastWrite > Self.maxExtrapolationSeconds
             var lag = wNow - readPos
             let delayChange = delay - trackedDelay
-            if abs(delayChange) > jump || abs(lag - lagTarget) > jump || lag > cap - 64 {
+            if !writerStalled, abs(delayChange) > jump || abs(lag - lagTarget) > jump || lag > cap - 64 {
                 // Large change (slider moved / resync): hop and crossfade from the old position.
                 oldPos = readPos
                 xfadeLeft = lag > cap - 64 ? 0 : xfadeLen
@@ -143,6 +149,9 @@ public final class DelayReader {
             }
             if Double(w) - readPos < span + Double(Self.halfTaps) + 3 {   // underrun: output silence this block and re-prime next time
                 primed = false
+                primeBlockedW = w
+                xfadeLeft = 0
+                lagFrames = Double(w) - readPos
                 return
             }
 
