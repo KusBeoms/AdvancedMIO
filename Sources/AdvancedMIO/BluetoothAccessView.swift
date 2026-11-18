@@ -40,9 +40,9 @@ private struct BluetoothHostPane: View {
                       systemImage: host.remotes.isEmpty ? "circle" : "checkmark.circle.fill")
                     .foregroundStyle(host.remotes.isEmpty ? Color.secondary : Color.green)
                 if host.audioReceiving {
-                    Label("소리 수신 중 · 이 Mac의 켜 둔 출력 장치로 재생됩니다", systemImage: "speaker.wave.2.fill")
+                    Label("수신 채널 연결됨 · 켜 둔 출력 장치로 재생합니다", systemImage: "speaker.wave.2.fill")
                         .foregroundStyle(.green)
-                    if let status = host.audioStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
+                    if let status = host.audioStatus { Text(status).font(.caption).monospacedDigit().foregroundStyle(.secondary) }
                 }
                 if let event = host.lastRemoteEvent {
                     Label(event, systemImage: "antenna.radiowaves.left.and.right").foregroundStyle(.secondary)
@@ -113,9 +113,10 @@ private struct BluetoothRemotePane: View {
                 }
                 .disabled(remote.sending)
                 if remote.audioLink != nil {
-                    Label("소리 전송 준비됨 · 메인 창 OUTPUTS에서 이 기기를 켜세요", systemImage: "speaker.wave.2.fill")
+                    Label("소리 전송 준비됨 · \(remote.audioQuality.title)", systemImage: "speaker.wave.2.fill")
                         .foregroundStyle(.green)
-                    if let status = remote.audioStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
+                    Text("메인 창 OUTPUTS에서 이 기기를 켜세요.").font(.caption)
+                    if let status = remote.audioStatus { Text(status).font(.caption).monospacedDigit().foregroundStyle(.secondary) }
                 } else if let note = remote.audioNote {
                     Text(note).foregroundStyle(.secondary)
                 }

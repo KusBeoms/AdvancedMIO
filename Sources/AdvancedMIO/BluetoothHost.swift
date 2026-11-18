@@ -158,7 +158,11 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
     private func startAudioStatusTimer() {
         audioStatusTimer?.invalidate()
         audioStatusTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.audioStatus = self?.audioReceiver?.statusText }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let status = self.audioReceiver?.statusText
+                if self.audioStatus != status { self.audioStatus = status }
+            }
         }
     }
 

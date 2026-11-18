@@ -81,7 +81,9 @@ struct ContentView: View {
                     .frame(width: 34, height: 34)
                     .background(Circle().fill(Color.white.opacity(0.08)))
             }
-            .buttonStyle(.plain).help("장치 목록 새로고침")
+            .buttonStyle(.plain)
+            .accessibilityLabel("장치 목록 새로고침")
+            .help("장치 목록 새로고침")
             startButton
         }
         .padding(.horizontal, 22)
@@ -103,6 +105,7 @@ struct ContentView: View {
                 .background(Circle().fill(Color.white.opacity(0.08)))
         }
         .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .accessibilityLabel("설정")
         .help("설정")
     }
 

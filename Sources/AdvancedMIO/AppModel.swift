@@ -150,7 +150,6 @@ final class AppModel: ObservableObject {
     /// Once a second: follow volume changes made elsewhere (keys, Sound settings); every few seconds re-read latencies.
     /// The connected Mac appeared as an output or went away: refresh the list, and drop it from a running engine.
     private func remoteLinkChanged() {
-        objectWillChange.send()
         let available = BluetoothRemote.shared.outputDevice != nil
         guard available != remoteWasAvailable else { return }
         remoteWasAvailable = available

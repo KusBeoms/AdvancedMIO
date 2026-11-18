@@ -6,19 +6,18 @@ import SwiftUI
 struct StatusPill: View {
     let running: Bool
     var armed = false
-    @State private var pulse = false
     var body: some View {
         HStack(spacing: 7) {
             Circle().fill(running ? Color(hex: 0x3DDC97) : Color.white.opacity(0.3))
                 .frame(width: 8, height: 8)
-                .scaleEffect(running && pulse ? 1.35 : 1)
                 .shadow(color: running ? Color(hex: 0x3DDC97).opacity(0.8) : .clear, radius: 4)
             Text(running ? "LIVE" : (armed ? "재생 대기" : "대기 중")).font(.system(size: 11, weight: .bold)).tracking(running ? 1.2 : 0)
         }
         .foregroundStyle(running ? Color(hex: 0x3DDC97) : Theme.text2)
         .padding(.horizontal, 12).frame(height: 28)
         .background(Capsule().fill(Color.white.opacity(0.06)))
-        .onAppear { withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { pulse = true } }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(running ? "오디오 라우팅 중" : (armed ? "재생 대기" : "라우팅 정지"))
     }
 }
 
