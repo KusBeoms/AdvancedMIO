@@ -196,7 +196,7 @@ final class RouterEngine {
                 do {
                 let isRemote = d.transport == .remote
                 let rate = isRemote ? AudioFraming.sampleRate : try HAL.validateFloatIO(d.id, scope: kAudioObjectPropertyScopeOutput)
-                let rings = ins.map { $0.state.ring } + (shared.map { [$0.ring] } ?? []) + extras.map { $0.ring }
+                let rings = ins.map { $0.state.ring } + (shared.map { [$0.ring] } ?? []) + (isRemote ? [] : extras.map { $0.ring })
                 let readers = rings.map { DelayReader(ring: $0, outputSampleRate: rate, delayMs: delayMs) }
                 readers.forEach { $0.setGain(Float(volume)) }
                 let state = OutputState(readers: readers, sampleRate: rate)

@@ -8,6 +8,14 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
     /// One connection for the whole app: closing the connection window must not drop it.
     static let shared = BluetoothRemote()
 
+    enum AudioQuality: Int, CaseIterable {
+        case standard = 128_000, high = 192_000
+        var title: String { self == .high ? "고음질 · 192 kbps" : "표준 · 128 kbps" }
+    }
+    @Published var audioQuality = AudioQuality(rawValue: UserDefaults.standard.integer(forKey: "bluetooth.audioBitRate")) ?? .standard {
+        didSet { UserDefaults.standard.set(audioQuality.rawValue, forKey: "bluetooth.audioBitRate") }
+    }
+
     enum Phase { case idle, scanning, connecting, enteringCode, authenticating, connected }
 
     struct Device: Identifiable {
@@ -266,7 +274,7 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
                 audioNote = "소리 전송 채널을 열지 못했습니다. 연결을 끊고 다시 시도하세요."
                 return
             }
-            guard let link = BluetoothAudioSender(channel: channel, code: code, onClosed: { [weak self] in
+            guard let link = BluetoothAudioSender(channel: channel, code: code, bitRate: audioQuality.rawValue, onClosed: { [weak self] in
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         guard let self else { return }

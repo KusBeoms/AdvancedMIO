@@ -96,12 +96,27 @@ final class JitterBufferTests: XCTestCase {
     func testPlayoutRateStaysWithinOnePercentAndPointsTowardTheTarget() {
         var j = JitterBuffer(target: 4, minTarget: 4, maxTarget: 8)
         for v in 1...4 { j.push(block(Float(v))) }
-        _ = j.pop()                                   // primed; 3 left, one below the target
+        _ = j.pop()                                   // primed; three queued after consuming the fourth
+        XCTAssertEqual(j.playoutRate, 1)
+        _ = j.pop()
         XCTAssertLessThan(j.playoutRate, 1)
         XCTAssertGreaterThanOrEqual(j.playoutRate, 0.99)
         j.push(block(9)); j.push(block(10)); j.push(block(11))
         XCTAssertGreaterThan(j.playoutRate, 1)
         XCTAssertLessThanOrEqual(j.playoutRate, 1.01)
+    }
+
+    func testDefaultStartupAndRecoveryAfterLateBurst() {
+        var j = JitterBuffer()
+        j.push(block(1)); j.push(block(2))
+        guard case .priming = j.pop() else { return XCTFail("started before the cushion filled") }
+        j.push(block(3))
+        for n in 1...3 { XCTAssertEqual(value(j.pop()), Float(n)) }
+        guard case .underrun = j.pop() else { return XCTFail("missed underrun") }
+        for n in 4...6 { j.push(block(Float(n))) }
+        guard case .priming = j.pop() else { return XCTFail("did not grow after underrun") }
+        j.push(block(7))
+        XCTAssertEqual(value(j.pop()), 4)
     }
 
     func testCushionShrinksAfterACalmPeriod() {

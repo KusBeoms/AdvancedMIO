@@ -37,16 +37,27 @@ final class RemotePlayout: @unchecked Sendable {
     private var jitter = JitterBuffer()
     private let queue = DispatchQueue(label: "advancedmio.remote-playout", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
+    private var clockRunning = false
     private var nextNs: UInt64 = 0
     private let silence = [Float](repeating: 0, count: AudioFraming.framesPerPacket)
     private static let blockNs = UInt64(AudioFraming.blockSeconds * 1e9)
 
     init(sink: RemoteAudioSource) { self.sink = sink }
 
-    func push(left: UnsafePointer<Float>, right: UnsafePointer<Float>, frames: Int) {
+    /// Returns true on the first block of a new burst, so the receiver can start its outputs while buffering.
+    func push(left: UnsafePointer<Float>, right: UnsafePointer<Float>, frames: Int) -> Bool {
         let block = JitterBuffer.Block(left: Array(UnsafeBufferPointer(start: left, count: frames)),
                                        right: Array(UnsafeBufferPointer(start: right, count: frames)))
-        lock.lock(); jitter.push(block); lock.unlock()
+        lock.lock()
+        let firstBlock = !clockRunning && jitter.depth == 0
+        jitter.push(block)
+        if !clockRunning, jitter.depth >= jitter.target, let timer {
+            clockRunning = true
+            nextNs = DispatchTime.now().uptimeNanoseconds
+            timer.schedule(deadline: DispatchTime(uptimeNanoseconds: nextNs), leeway: .microseconds(500))
+        }
+        lock.unlock()
+        return firstBlock
     }
 
     struct Snapshot { let bufferMs: Double; let targetMs: Double; let underruns: Int; let dropped: Int }
@@ -59,10 +70,8 @@ final class RemotePlayout: @unchecked Sendable {
 
     func start() {
         guard timer == nil else { return }
-        nextNs = DispatchTime.now().uptimeNanoseconds
         let t = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
         t.setEventHandler { [weak self] in self?.tick(t) }      // `t` is released with the handler when cancelled
-        t.schedule(deadline: .now(), leeway: .microseconds(500))
         timer = t
         t.resume()
     }
@@ -75,7 +84,14 @@ final class RemotePlayout: @unchecked Sendable {
     private func tick(_ t: DispatchSourceTimer) {
         lock.lock()
         let output = jitter.pop()
-        let rate = jitter.playoutRate
+        if case .block = output {
+            let period = UInt64(Double(Self.blockNs) / jitter.playoutRate)
+            nextNs = max(nextNs + period, DispatchTime.now().uptimeNanoseconds)
+            t.schedule(deadline: DispatchTime(uptimeNanoseconds: nextNs), leeway: .microseconds(500))
+        } else {
+            // This is a one-shot timer. The next full cushion restarts it after a pause.
+            clockRunning = false
+        }
         lock.unlock()
         switch output {
         case .block(let b):
@@ -89,11 +105,6 @@ final class RemotePlayout: @unchecked Sendable {
         case .priming:
             break
         }
-        // Next deadline is relative to the previous one (not to "now"), so scheduling jitter does not accumulate.
-        nextNs += UInt64(Double(Self.blockNs) / rate)
-        let now = DispatchTime.now().uptimeNanoseconds
-        if nextNs < now { nextNs = now }
-        t.schedule(deadline: DispatchTime(uptimeNanoseconds: nextNs), leeway: .microseconds(500))
     }
 }
 
@@ -104,6 +115,7 @@ final class BluetoothAudioReceiver: NSObject, StreamDelegate {
     private let channel: CBL2CAPChannel
     private let authorize: (String) -> Bool
     private let outputLagMs: @MainActor () -> Double
+    private let onPlaybackStart: () -> Void
     private let onAccepted: () -> Void
     private let onClosed: (BluetoothAudioReceiver) -> Void
     private let playout: RemotePlayout
@@ -114,11 +126,12 @@ final class BluetoothAudioReceiver: NSObject, StreamDelegate {
 
     init(channel: CBL2CAPChannel, sink: RemoteAudioSource, authorize: @escaping (String) -> Bool,
          outputLagMs: @escaping @MainActor () -> Double,
-         onAccepted: @escaping () -> Void, onClosed: @escaping (BluetoothAudioReceiver) -> Void) {
+         onPlaybackStart: @escaping () -> Void, onAccepted: @escaping () -> Void, onClosed: @escaping (BluetoothAudioReceiver) -> Void) {
         self.channel = channel
         self.playout = RemotePlayout(sink: sink)
         self.authorize = authorize
         self.outputLagMs = outputLagMs
+        self.onPlaybackStart = onPlaybackStart
         self.onAccepted = onAccepted
         self.onClosed = onClosed
         super.init()
@@ -173,12 +186,17 @@ final class BluetoothAudioReceiver: NSObject, StreamDelegate {
                 onAccepted()
             } else if frame.type == .audio {
                 guard let packet = AudioPacket(body: frame.body) else { close(); return }
-                if let pcm = decoder?.decode(packet.payload) { playout.push(left: pcm.left, right: pcm.right, frames: pcm.frames) }
+                if let pcm = decoder?.decode(packet.payload),
+                   playout.push(left: pcm.left, right: pcm.right, frames: pcm.frames) {
+                    onPlaybackStart()
+                }
                 let snapshot = playout.snapshot
                 let ack = AudioAck(sequence: packet.sequence, echoSendMs: packet.sendMs,
                                    bufferMs: UInt16(min(65_000, max(0, snapshot.bufferMs))),
                                    outputLagMs: UInt16(min(65_000, max(0, outputLagMs()))))
-                pendingAcks.append(ack.frame)
+                // ACKs are cumulative. Preserve the head (possibly partially sent) and only the latest successor.
+                if pendingAcks.count == 2 { pendingAcks[1] = ack.frame }
+                else { pendingAcks.append(ack.frame) }
                 flushAcks()
             } else {
                 close()
@@ -198,8 +216,6 @@ final class BluetoothAudioReceiver: NSObject, StreamDelegate {
                 pendingAcks.removeFirst()
             }
         }
-        // The sender stopped reading: keep the backlog bounded, but never drop the frame that is partly written.
-        if pendingAcks.count > 200 { pendingAcks.removeSubrange(1..<(pendingAcks.count - 100)) }
     }
 }
 
@@ -215,7 +231,7 @@ final class BluetoothAudioSender: NSObject, StreamDelegate, @unchecked Sendable 
     private var closed = false
     private var parser = AudioFrameParser()
     private var nextSequence: UInt32 = 0
-    private var acknowledged = 0            // packets acknowledged so far (acks arrive in order)
+    private var oldestUnacknowledged: UInt32 = 0
     private var sentPackets = 0
     private var droppedPackets = 0
     private var rttMs = 0.0
@@ -227,8 +243,8 @@ final class BluetoothAudioSender: NSObject, StreamDelegate, @unchecked Sendable 
     /// About 0.2 s of audio in flight.
     private static let window = 10
 
-    init?(channel: CBL2CAPChannel, code: String, onClosed: @escaping @Sendable () -> Void) {
-        guard let encoder = AACEncoder(), let hello = AudioFraming.hello(code: code, cookie: encoder.cookie) else { return nil }
+    init?(channel: CBL2CAPChannel, code: String, bitRate: Int, onClosed: @escaping @Sendable () -> Void) {
+        guard let encoder = AACEncoder(bitRate: bitRate), let hello = AudioFraming.hello(code: code, cookie: encoder.cookie) else { return nil }
         self.channel = channel
         self.encoder = encoder
         self.onClosed = onClosed
@@ -256,7 +272,7 @@ final class BluetoothAudioSender: NSObject, StreamDelegate, @unchecked Sendable 
 
     var statusText: String {
         lock.lock(); defer { lock.unlock() }
-        guard haveAck else { return "연결 확인 중…" }
+        guard haveAck else { return sentPackets == 0 ? "첫 오디오 패킷 대기 중" : "상대 Mac의 수신 확인 대기 중" }
         let latency = AudioFraming.blockSeconds * 1000 + rttMs / 2 + remoteBufferMs + remoteOutputLagMs
         return String(format: "지연 약 %.0f ms (왕복 %.0f · 상대 버퍼 %.0f · 상대 출력 %.0f) · 버린 패킷 %d/%d",
                       latency, rttMs, remoteBufferMs, remoteOutputLagMs, droppedPackets, sentPackets + droppedPackets)
@@ -264,18 +280,25 @@ final class BluetoothAudioSender: NSObject, StreamDelegate, @unchecked Sendable 
 
     /// Called from the router's output timer thread with exactly `AudioFraming.framesPerPacket` frames.
     func push(left: UnsafePointer<Float>, right: UnsafePointer<Float>) {
-        guard isOpen, let payload = encoder.encode(left: left, right: right) else { return }
         lock.lock()
-        if Int(nextSequence) - acknowledged >= Self.window {      // the link is behind: drop rather than add delay
+        guard !closed else { lock.unlock(); return }
+        if nextSequence &- oldestUnacknowledged >= Self.window {      // the link is behind: drop rather than add delay
             droppedPackets += 1
             lock.unlock()
             return
         }
+        lock.unlock()
+
+        // Only the serial render queue produces packets. ACKs can only free more space during encoding.
+        guard let payload = encoder.encode(left: left, right: right) else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return }
+        guard payload.count <= AudioFraming.maxBody - 8 else { droppedPackets += 1; return }
         let packet = AudioPacket(sequence: nextSequence, sendMs: monotonicMs(), payload: payload)
         nextSequence &+= 1
         sentPackets += 1
         queue.append(packet.frame)
-        lock.unlock()
         DispatchQueue.main.async { [self] in flush() }
     }
 
@@ -319,7 +342,8 @@ final class BluetoothAudioSender: NSObject, StreamDelegate, @unchecked Sendable 
         lock.lock()
         for frame in frames where frame.type == .ack {
             guard let ack = AudioAck(body: frame.body) else { continue }
-            acknowledged = max(acknowledged, Int(ack.sequence) + 1)
+            guard ack.sequence &- oldestUnacknowledged < nextSequence &- oldestUnacknowledged else { continue }
+            oldestUnacknowledged = ack.sequence &+ 1
             let rtt = Double(now &- ack.echoSendMs)
             if rtt >= 0, rtt < 10_000 { rttMs = haveAck ? rttMs * 0.9 + rtt * 0.1 : rtt }
             remoteBufferMs = Double(ack.bufferMs)

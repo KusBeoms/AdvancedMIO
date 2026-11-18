@@ -27,7 +27,7 @@ public struct JitterBuffer {
     private let calmTicksBeforeShrink: Int
 
     /// `calmSeconds` is how long without an underrun before the cushion shrinks by one block.
-    public init(target: Int = 6, minTarget: Int = 4, maxTarget: Int = 16, calmSeconds: Double = 30) {
+    public init(target: Int = 3, minTarget: Int = 2, maxTarget: Int = 16, calmSeconds: Double = 30) {
         self.minTarget = minTarget
         self.maxTarget = maxTarget
         self.target = min(maxTarget, max(minTarget, target))
@@ -71,7 +71,8 @@ public struct JitterBuffer {
     /// This absorbs the small clock difference between the two Macs without ever dropping audio.
     public var playoutRate: Double {
         guard primed else { return 1 }
-        let error = Double(blocks.count - target)
+        // Measured just after pop: a healthy cushion now contains one block fewer.
+        let error = Double(blocks.count - (target - 1))
         return 1 + max(-0.01, min(0.01, error * 0.004))
     }
 }

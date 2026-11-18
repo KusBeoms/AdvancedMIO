@@ -10,13 +10,14 @@ final class AACEncoder {
     /// Decoder setup data (AudioSpecificConfig); sent once in the hello frame.
     let cookie: Data
 
-    init?(bitRate: Int = 128_000) {
+    init?(bitRate: Int) {
         let rate = AudioFraming.sampleRate
         guard let pcm = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 2, interleaved: false),
               let aac = AVAudioFormat(settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: rate,
                                                  AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: bitRate]),
               let converter = AVAudioConverter(from: pcm, to: aac),
               let input = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: AVAudioFrameCount(AudioFraming.framesPerPacket)) else { return nil }
+        converter.bitRate = bitRate
         self.converter = converter
         self.input = input
         output = AVAudioCompressedBuffer(format: aac, packetCapacity: 1, maximumPacketSize: converter.maximumOutputPacketSize)

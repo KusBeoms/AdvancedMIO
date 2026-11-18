@@ -82,6 +82,10 @@ private struct BluetoothRemotePane: View {
                 }
             case .enteringCode:
                 deviceHeader
+                Picker("소리 전송 음질", selection: $remote.audioQuality) {
+                    ForEach(BluetoothRemote.AudioQuality.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                .help("소리가 자주 끊기는 연결에서는 표준 음질을 선택하세요.")
                 Text("연결할 Mac에 표시된 6자리 코드를 입력하세요.").foregroundStyle(.secondary)
                 HStack {
                     SecureField("6자리 접속 코드", text: Binding(get: { codeDraft }, set: { input in

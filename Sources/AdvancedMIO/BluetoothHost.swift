@@ -134,6 +134,10 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
                 channel: channel, sink: AppModel.shared.remoteAudio,
                 authorize: { [weak self] in self?.authorizeAudio($0) ?? false },
                 outputLagMs: { AppModel.shared.worstOutputLagMs },
+                onPlaybackStart: {
+                    let model = AppModel.shared
+                    if model.engine == nil, model.running, !model.enabledOutputs.isEmpty { model.rebuildEngine() }
+                },
                 onAccepted: { [weak self] in
                     self?.audioReceiving = true
                     self?.startAudioStatusTimer()
