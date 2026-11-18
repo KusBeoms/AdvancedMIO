@@ -179,7 +179,7 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
                 fail("이 기기에서 AdvancedMIO 서비스를 찾지 못했습니다.")
                 return
             }
-            peripheral.discoverCharacteristics([BluetoothGATT.identity, BluetoothGATT.control], for: service)
+            peripheral.discoverCharacteristics([BluetoothGATT.identity, BluetoothGATT.control, BluetoothGATT.presence], for: service)
         }
     }
 
@@ -193,6 +193,9 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
                 return
             }
             self.control = control
+            if let presence = service.characteristics?.first(where: { $0.uuid == BluetoothGATT.presence }) {
+                peripheral.setNotifyValue(true, for: presence)      // lets the Mac show that this remote is connected
+            }
             peripheral.readValue(for: identity)
         }
     }

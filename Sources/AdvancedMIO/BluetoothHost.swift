@@ -6,6 +6,8 @@ enum BluetoothGATT {
     static let service = CBUUID(string: "7569D3E1-B156-4108-9DBC-B87F1B42F012")
     static let identity = CBUUID(string: "7569D3E2-B156-4108-9DBC-B87F1B42F012")
     static let control = CBUUID(string: "7569D3E3-B156-4108-9DBC-B87F1B42F012")
+    /// Subscribing to it is how a remote announces "I am connected" (Core Bluetooth reports no plain connections to a peripheral).
+    static let presence = CBUUID(string: "7569D3E4-B156-4108-9DBC-B87F1B42F012")
     static let needsBundle = "블루투스를 사용하려면 빌드한 AdvancedMIO.app을 실행하세요."
 
     static var hasUsageDescription: Bool {
@@ -35,6 +37,9 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
     @Published private(set) var status: Status = .off
     @Published private(set) var code = ""
     @Published private(set) var lastRemoteEvent: String?
+    /// Connected remotes by Core Bluetooth central identifier; the value is whether the code was accepted.
+    @Published private(set) var remotes: [UUID: Bool] = [:]
+    var authenticatedCount: Int { remotes.values.filter { $0 }.count }
 
     // The short identifier fits in a BLE scan response. The identity characteristic also exposes it after discovery.
     let name = "MIO-" + UUID().uuidString.prefix(4)
@@ -81,6 +86,7 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
         manager = nil
         service = nil
         code = ""
+        remotes = [:]
         status = .off
     }
 
@@ -101,7 +107,9 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
             let control = CBMutableCharacteristic(type: BluetoothGATT.control, properties: .write,
                                                   value: nil, permissions: [.writeable, .writeEncryptionRequired])
             let service = CBMutableService(type: BluetoothGATT.service, primary: true)
-            service.characteristics = [identity, control]
+            let presence = CBMutableCharacteristic(type: BluetoothGATT.presence, properties: [.notify, .read],
+                                                   value: nil, permissions: .readable)
+            service.characteristics = [identity, control, presence]
             self.service = service
             peripheral.add(service)
         }
@@ -123,6 +131,23 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
         MainActor.assumeIsolated {
             guard peripheral === manager, status == .starting, peripheral.state == .poweredOn else { return }
             status = error.map { .failed($0.localizedDescription) } ?? .available
+        }
+    }
+
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral,
+                                       didSubscribeTo characteristic: CBCharacteristic) {
+        MainActor.assumeIsolated {
+            guard peripheral === manager, characteristic.uuid == BluetoothGATT.presence else { return }
+            if remotes[central.identifier] == nil { remotes[central.identifier] = false }
+            noteRemote("원격 기기가 연결되었습니다")
+        }
+    }
+
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral,
+                                       didUnsubscribeFrom characteristic: CBCharacteristic) {
+        MainActor.assumeIsolated {
+            guard peripheral === manager, characteristic.uuid == BluetoothGATT.presence else { return }
+            if remotes.removeValue(forKey: central.identifier) != nil { noteRemote("원격 기기 연결이 끊겼습니다") }
         }
     }
 
@@ -153,6 +178,7 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
         case .wrongCode: return .insufficientAuthorization
         case .rateLimited: return .insufficientResources
         case .allowed:
+            remotes[request.central.identifier] = true
             guard let action = message.action else {
                 noteRemote("원격 기기가 코드를 인증했습니다")
                 return .success

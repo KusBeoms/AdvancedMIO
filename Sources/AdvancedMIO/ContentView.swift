@@ -6,6 +6,7 @@ struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.openWindow) private var openWindow
     @ObservedObject private var remote = BluetoothRemote.shared
+    @ObservedObject private var bluetoothHost = BluetoothHost.shared
     @State private var showHistory = false
     @State private var presetNameDraft = ""
     @State private var askPresetName = false
@@ -63,7 +64,8 @@ struct ContentView: View {
             Button { openWindow(id: "bluetooth") } label: {
                 HStack(spacing: 6) {
                     Symbol("antenna.radiowaves.left.and.right", size: 13)
-                    Text(remote.phase == .connected ? "연결됨 · \(remote.deviceName)" : "블루투스")
+                    Text(remote.phase == .connected ? "연결됨 · \(remote.deviceName)"
+                         : bluetoothHost.remotes.isEmpty ? "블루투스" : "원격 접속 \(bluetoothHost.remotes.count)대")
                         .font(.system(size: 12, weight: .semibold))
                 }
                 .padding(.horizontal, 12)

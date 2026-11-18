@@ -5,6 +5,7 @@ import SwiftUI
 /// The menu bar menu: routing on/off, presets, device switches, window, settings.
 struct MenuBarContent: View {
     @ObservedObject private var remote = BluetoothRemote.shared
+    @ObservedObject private var host = BluetoothHost.shared
     @EnvironmentObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
 
@@ -43,6 +44,9 @@ struct MenuBarContent: View {
                 Divider()
                 Button("연결 끊기") { remote.close() }
             }
+        }
+        if !host.remotes.isEmpty {
+            Text("원격 접속 \(host.remotes.count)대 (인증 \(host.authenticatedCount)대)")
         }
         Button("블루투스 연결") { openWindow(id: "bluetooth"); NSApp.activate(ignoringOtherApps: true) }
         Menu("설정") {

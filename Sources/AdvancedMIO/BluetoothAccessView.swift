@@ -35,6 +35,10 @@ private struct BluetoothHostPane: View {
                     Button("새 코드") { host.rotateCode() }
                         .help("기존 코드로 연결한 기기에 새 코드를 다시 입력해야 합니다.")
                 }
+                Label(host.remotes.isEmpty ? "연결된 기기 없음"
+                      : "연결된 기기 \(host.remotes.count)대 · 코드 인증 \(host.authenticatedCount)대",
+                      systemImage: host.remotes.isEmpty ? "circle" : "checkmark.circle.fill")
+                    .foregroundStyle(host.remotes.isEmpty ? Color.secondary : Color.green)
                 if let event = host.lastRemoteEvent {
                     Label(event, systemImage: "antenna.radiowaves.left.and.right").foregroundStyle(.secondary)
                 }
