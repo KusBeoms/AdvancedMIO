@@ -35,6 +35,9 @@ private struct BluetoothHostPane: View {
                     Button("새 코드") { host.rotateCode() }
                         .help("기존 코드로 연결한 기기에 새 코드를 다시 입력해야 합니다.")
                 }
+                if let event = host.lastRemoteEvent {
+                    Label(event, systemImage: "antenna.radiowaves.left.and.right").foregroundStyle(.secondary)
+                }
             case .starting:
                 ProgressView().controlSize(.small)
                 Text("블루투스 접속을 준비하고 있습니다.").foregroundStyle(.secondary)
@@ -52,7 +55,7 @@ private struct BluetoothHostPane: View {
 }
 
 private struct BluetoothRemotePane: View {
-    @StateObject private var remote = BluetoothRemote()
+    @ObservedObject private var remote = BluetoothRemote.shared
     @State private var codeDraft = ""
     @FocusState private var codeFocused: Bool
 
@@ -87,16 +90,17 @@ private struct BluetoothRemotePane: View {
                 }
             case .connected:
                 deviceHeader
-                Text("코드 인증 완료").foregroundStyle(.secondary)
+                Label("연결됨 · 창을 닫아도 연결은 유지됩니다 (메뉴 바에서도 제어)", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
                 HStack {
                     ForEach(BluetoothControlAction.allCases, id: \.self) { action in
-                        Button(label(for: action)) { remote.send(action) }
+                        Button(action.title) { remote.send(action) }
                     }
                     if remote.sending { ProgressView().controlSize(.small) }
                 }
                 .disabled(remote.sending)
                 if let action = remote.lastAction {
-                    Label("\(label(for: action)) 완료", systemImage: "checkmark.circle")
+                    Label("\(action.title) 완료", systemImage: "checkmark.circle")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -105,7 +109,7 @@ private struct BluetoothRemotePane: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(20)
-        .onDisappear { remote.close(); codeDraft = "" }
+        .onDisappear { codeDraft = "" }      // the connection stays up; only 연결 끊기 drops it
     }
 
     private var browser: some View {
@@ -143,14 +147,6 @@ private struct BluetoothRemotePane: View {
             Text(remote.deviceName).font(.headline)
             Spacer()
             Button("연결 끊기") { remote.close(); codeDraft = "" }
-        }
-    }
-
-    private func label(for action: BluetoothControlAction) -> String {
-        switch action {
-        case .start: return "라우팅 시작"
-        case .stop: return "라우팅 정지"
-        case .zero: return "최저 지연 0으로"
         }
     }
 }

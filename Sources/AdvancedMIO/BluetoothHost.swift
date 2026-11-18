@@ -34,6 +34,7 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
     @Published private(set) var enabled = UserDefaults.standard.object(forKey: preferenceKey) as? Bool ?? true
     @Published private(set) var status: Status = .off
     @Published private(set) var code = ""
+    @Published private(set) var lastRemoteEvent: String?
 
     // The short identifier fits in a BLE scan response. The identity characteristic also exposes it after discovery.
     let name = "MIO-" + UUID().uuidString.prefix(4)
@@ -134,6 +135,10 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
         }
     }
 
+    private func noteRemote(_ text: String) {
+        lastRemoteEvent = text + " · " + Date().formatted(date: .omitted, time: .standard)
+    }
+
     private func handle(_ request: CBATTRequest, on peripheral: CBPeripheralManager) -> CBATTError.Code {
         guard peripheral === manager, status == .available, request.characteristic.uuid == BluetoothGATT.control else {
             return .writeNotPermitted
@@ -148,10 +153,14 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
         case .wrongCode: return .insufficientAuthorization
         case .rateLimited: return .insufficientResources
         case .allowed:
-            guard let action = message.action else { return .success }
+            guard let action = message.action else {
+                noteRemote("원격 기기가 코드를 인증했습니다")
+                return .success
+            }
             let model = AppModel.shared
             guard !model.busy, action != .zero || model.canZeroLag else { return .unlikelyError }
             model.handle(action.command)
+            noteRemote("원격 명령: \(action.title)")
             return .success
         }
     }

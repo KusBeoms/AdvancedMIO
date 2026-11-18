@@ -1,8 +1,10 @@
+import MIOCore
 import AppKit
 import SwiftUI
 
 /// The menu bar menu: routing on/off, presets, device switches, window, settings.
 struct MenuBarContent: View {
+    @ObservedObject private var remote = BluetoothRemote.shared
     @EnvironmentObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
 
@@ -33,6 +35,15 @@ struct MenuBarContent: View {
 
         Divider()
         Button("창 열기") { openWindow(id: "main"); AppWindow.show() }
+        if remote.phase == .connected {
+            Menu("원격 연결: \(remote.deviceName)") {
+                ForEach(BluetoothControlAction.allCases, id: \.self) { action in
+                    Button(action.title) { remote.send(action) }.disabled(remote.sending)
+                }
+                Divider()
+                Button("연결 끊기") { remote.close() }
+            }
+        }
         Button("블루투스 연결") { openWindow(id: "bluetooth"); NSApp.activate(ignoringOtherApps: true) }
         Menu("설정") {
             Toggle("지연 변화 경고 표시", isOn: Binding(get: { model.latencyWarningsEnabled }, set: { model.setLatencyWarnings($0) }))

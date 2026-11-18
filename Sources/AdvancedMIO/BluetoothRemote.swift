@@ -4,6 +4,9 @@ import SwiftUI
 
 @MainActor
 final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+    /// One connection for the whole app: closing the connection window must not drop it.
+    static let shared = BluetoothRemote()
+
     enum Phase { case idle, scanning, connecting, enteringCode, authenticating, connected }
 
     struct Device: Identifiable {
@@ -247,6 +250,16 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
                 code = nil
                 phase = .enteringCode
             }
+        }
+    }
+}
+
+extension BluetoothControlAction {
+    var title: String {
+        switch self {
+        case .start: return "라우팅 시작"
+        case .stop: return "라우팅 정지"
+        case .zero: return "최저 지연 0으로"
         }
     }
 }

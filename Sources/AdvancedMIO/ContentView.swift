@@ -5,6 +5,7 @@ enum SideTab { case source, spatial }
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.openWindow) private var openWindow
+    @ObservedObject private var remote = BluetoothRemote.shared
     @State private var showHistory = false
     @State private var presetNameDraft = ""
     @State private var askPresetName = false
@@ -62,7 +63,8 @@ struct ContentView: View {
             Button { openWindow(id: "bluetooth") } label: {
                 HStack(spacing: 6) {
                     Symbol("antenna.radiowaves.left.and.right", size: 13)
-                    Text("블루투스").font(.system(size: 12, weight: .semibold))
+                    Text(remote.phase == .connected ? "연결됨 · \(remote.deviceName)" : "블루투스")
+                        .font(.system(size: 12, weight: .semibold))
                 }
                 .padding(.horizontal, 12)
                 .frame(height: 34)
