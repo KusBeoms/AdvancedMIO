@@ -38,9 +38,13 @@ public final class StereoRing {
         let skip = frames - n
         let now = clock()
         lock.lock()
-        for i in 0..<n {
-            let p = (written + i) & mask
-            l[p] = left[skip + i]; r[p] = right[skip + i]
+        let start = (written + skip) & mask
+        let first = min(n, capacity - start)
+        (l + start).update(from: left + skip, count: first)
+        (r + start).update(from: right + skip, count: first)
+        if first < n {
+            l.update(from: left + skip + first, count: n - first)
+            r.update(from: right + skip + first, count: n - first)
         }
         written += frames
         if frames > biggestChunk { biggestChunk = frames }

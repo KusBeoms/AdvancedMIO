@@ -403,12 +403,22 @@ final class AppModel: ObservableObject {
     /// Turn routing on: the engine starts as soon as something plays to the AdvancedMIO device.
     func arm() {
         running = true
-        pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
-        }
+        scheduleActivityCheck()
         tick()
         publishReportedLatency()
+    }
+
+    private func scheduleActivityCheck() {
+        pollTimer?.invalidate()
+        guard running else { return }
+        // While armed, the shared-memory check only reads the driver's write index. Check less often during playback.
+        let interval = !capturing && shared != nil ? 0.1 : 0.5
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
+        timer.tolerance = interval * 0.1
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
     }
 
     func disarm() {
@@ -461,6 +471,7 @@ final class AppModel: ObservableObject {
                     error = e.failures.map { "\($0.name) 출력 실패: \($0.message)" }.joined(separator: "\n")
                 }
                 capturing = true
+                scheduleActivityCheck()
             } catch {
                 self.error = error.localizedDescription
             }
@@ -469,7 +480,10 @@ final class AppModel: ObservableObject {
 
     func stopEngine() {
         engine?.stop(); engine = nil
-        capturing = false
+        if capturing {
+            capturing = false
+            scheduleActivityCheck()
+        }
     }
 
     func ensureMicAccess() async -> Bool {

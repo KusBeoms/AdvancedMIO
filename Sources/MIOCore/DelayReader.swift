@@ -1,6 +1,6 @@
 import Foundation
 
-/// Reads a `StereoRing` at an adjustable delay, resampling input-rate → output-rate (linear interpolation),
+/// Reads a `StereoRing` at an adjustable delay, resampling input-rate → output-rate with a windowed sinc filter,
 /// and keeping the lag locked to `delay + safety margin` despite clock drift between devices.
 public final class DelayReader {
     public static let maxDelayMs: Double = 1000
@@ -44,7 +44,15 @@ public final class DelayReader {
     // unit DC gain. Linear/cubic interpolation leaves strong images when a device runs at twice the source rate
     // (e.g. a 96 kHz MacBook speaker fed from 48 kHz) and is heard as "broken" sound; this keeps them ~70 dB down.
     private static let halfTaps = 16, taps = 32, phases = 256
-    private let kernel: UnsafeMutablePointer<Float>
+    private final class Kernel {
+        let weights: UnsafeMutablePointer<Float>
+        init(cutoff: Double) { weights = DelayReader.makeKernel(cutoff: cutoff) }
+        deinit { weights.deallocate() }
+    }
+
+    // Equal-rate and upsampling readers all use the same immutable coefficients.
+    private static let fullBandwidth = Kernel(cutoff: 1)
+    private let kernel: Kernel
 
     public private(set) var lagFrames: Double = 0      // diagnostics
     public private(set) var resyncCount = 0
@@ -52,10 +60,9 @@ public final class DelayReader {
     public init(ring: StereoRing, outputSampleRate: Double, delayMs: Double = 0) {
         self.ring = ring
         self.outRate = outputSampleRate
-        kernel = Self.makeKernel(cutoff: min(1, outputSampleRate / ring.sampleRate))
+        kernel = outputSampleRate >= ring.sampleRate ? Self.fullBandwidth : Kernel(cutoff: outputSampleRate / ring.sampleRate)
         setDelay(ms: delayMs)
     }
-    deinit { kernel.deallocate() }
 
     /// `cutoff` is relative to the input Nyquist frequency: 1 when upsampling or equal rates, < 1 when downsampling
     /// (low-pass below the output's Nyquist so nothing aliases).
@@ -82,7 +89,16 @@ public final class DelayReader {
             let sum = row.reduce(0, +)
             for t in 0..<taps { table[p * taps + t] = Float(row[t] / sum) }
         }
-        return table
+        // Store the fractional-phase slope next to each row to avoid subtracting coefficients on the audio thread.
+        let weights = UnsafeMutablePointer<Float>.allocate(capacity: phases * taps * 2)
+        for p in 0..<phases {
+            let row = table + p * taps
+            let dest = weights + p * taps * 2
+            dest.update(from: row, count: taps)
+            for t in 0..<taps { dest[taps + t] = row[taps + t] - row[t] }
+        }
+        table.deallocate()
+        return weights
     }
 
     public func setDelay(ms: Double) {
@@ -168,16 +184,34 @@ public final class DelayReader {
             lagTarget += slew; lagAvg += slew
             let step = ratio * (1 + adj) - slew / Double(frames)
 
+            let weights = kernel.weights
             @inline(__always) func sample(_ pos: Double) -> (Float, Float) {
-                let i = Int(pos)                       // pos ≥ 0
+                guard pos >= 0 else { return (0, 0) }  // a new delay can reach before the first recorded frame
+                let i = Int(pos)
                 let ph = (pos - Double(i)) * Double(Self.phases)
                 let p0 = Int(ph)
                 let a = Float(ph - Double(p0))
-                let k0 = kernel + p0 * Self.taps, k1 = k0 + Self.taps
+                let k0 = weights + p0 * (2 * Self.taps), slope = k0 + Self.taps
                 let base = i - Self.halfTaps + 1
+                // Most windows are contiguous. Accumulate eight taps at a time and wrap only at the ring seam.
+                let start = base & mask
+                if start + Self.taps <= ring.capacity {
+                    typealias Lane = SIMD8<Float>
+                    var left = Lane.zero, right = Lane.zero
+                    let inputL = l + start, inputR = r + start
+                    @inline(__always) func accumulate(_ t: Int) {
+                        let h0 = UnsafeRawPointer(k0 + t).loadUnaligned(as: Lane.self)
+                        let dh = UnsafeRawPointer(slope + t).loadUnaligned(as: Lane.self)
+                        let h = h0.addingProduct(dh, Lane(repeating: a))
+                        left = left.addingProduct(h, UnsafeRawPointer(inputL + t).loadUnaligned(as: Lane.self))
+                        right = right.addingProduct(h, UnsafeRawPointer(inputR + t).loadUnaligned(as: Lane.self))
+                    }
+                    accumulate(0); accumulate(8); accumulate(16); accumulate(24)
+                    return (left.sum(), right.sum())
+                }
                 var sl: Float = 0, sr: Float = 0
                 for t in 0..<Self.taps {
-                    let h = k0[t] + (k1[t] - k0[t]) * a
+                    let h = k0[t] + slope[t] * a
                     let idx = (base + t) & mask
                     sl += h * l[idx]; sr += h * r[idx]
                 }

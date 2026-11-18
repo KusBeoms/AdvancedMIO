@@ -80,8 +80,13 @@ private final class OutputState {
 
     func process(_ abl: UnsafeMutableAudioBufferListPointer) {
         let (count, frames) = gather(abl, into: refs)
-        callbacks += 1
         guard frames > 0 else { level = 0; return }
+        render(frames: frames)
+        ChannelMapping.fillOutput(UnsafeBufferPointer(start: refs, count: count), frames: frames, left: l, right: r)
+    }
+
+    func render(frames: Int) {
+        callbacks += 1
         framesRendered += frames
         for i in 0..<frames { l[i] = 0; r[i] = 0 }
         for rd in readers { rd.render(into: l, r, frames: frames) }
@@ -105,7 +110,6 @@ private final class OutputState {
             peak = max(peak, abs(l[i]), abs(r[i]))
         }
         level = peak
-        ChannelMapping.fillOutput(UnsafeBufferPointer(start: refs, count: count), frames: frames, left: l, right: r)
     }
 }
 
@@ -124,26 +128,13 @@ private final class RemoteOutputIO: OutputIO {
     private let queue = DispatchQueue(label: "advancedmio.remote-output", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
     private let frames = AudioFraming.framesPerPacket
-    private let interleaved: UnsafeMutablePointer<Float>
-    private let l: UnsafeMutablePointer<Float>
-    private let r: UnsafeMutablePointer<Float>
-    private let list: UnsafeMutableAudioBufferListPointer
 
     init(state: OutputState, link: BluetoothAudioSender) {
         self.state = state
         self.link = link
-        interleaved = .allocate(capacity: frames * 2)
-        l = .allocate(capacity: frames)
-        r = .allocate(capacity: frames)
-        list = AudioBufferList.allocate(maximumBuffers: 1)
-        list[0] = AudioBuffer(mNumberChannels: 2, mDataByteSize: UInt32(frames * 2 * MemoryLayout<Float>.size),
-                              mData: UnsafeMutableRawPointer(interleaved))
     }
 
-    deinit {
-        stop()
-        interleaved.deallocate(); l.deallocate(); r.deallocate(); free(list.unsafeMutablePointer)
-    }
+    deinit { stop() }
 
     func start() throws {
         guard link.isOpen else { throw IOError(message: "블루투스 연결이 끊겼습니다") }
@@ -161,9 +152,8 @@ private final class RemoteOutputIO: OutputIO {
     }
 
     private func tick() {
-        state.process(list)
-        for i in 0..<frames { l[i] = interleaved[2 * i]; r[i] = interleaved[2 * i + 1] }
-        link.push(left: l, right: r)
+        state.render(frames: frames)
+        link.push(left: state.l, right: state.r)
     }
 }
 

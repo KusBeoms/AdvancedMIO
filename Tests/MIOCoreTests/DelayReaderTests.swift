@@ -63,6 +63,16 @@ final class DelayReaderTests: XCTestCase {
         return (newest - playedFrame) / sim.inRate * 1000
     }
 
+    func testIncreasingDelayBeforeEnoughHistoryExists() {
+        var sim = Sim(signal: { _ in 0.5 })
+        sim.run(seconds: 0.1)
+        sim.reader.setDelay(ms: 500)
+        sim.run(seconds: 0.2)
+        XCTAssertTrue(sim.out.suffix(512).allSatisfy { $0 == 0 })
+        sim.run(seconds: 0.5)
+        XCTAssertEqual(sim.out.last ?? 0, 0.5, accuracy: 1e-4)
+    }
+
     func testSilenceBeforePrimed() {
         var sim = Sim()
         sim.readBlock(512)
@@ -344,6 +354,12 @@ final class DelayReaderTests: XCTestCase {
         var s = (0..<3000).map { Float($0) }
         s.withUnsafeMutableBufferPointer { p in ring.write(left: p.baseAddress!, right: p.baseAddress!, frames: 3000) }
         XCTAssertEqual(ring.writeIndex, 3000)
+        ring.locked { end, _, left, right, mask, _ in
+            for index in (end - ring.capacity)..<end {
+                XCTAssertEqual(left[index & mask], Float(index))
+                XCTAssertEqual(right[index & mask], Float(index))
+            }
+        }
     }
 
     func testExtremeDelayWithSmallRingDoesNotCrash() {
