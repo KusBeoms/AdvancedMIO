@@ -25,6 +25,8 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
     /// The open audio channel to the connected Mac. While it exists, that Mac is offered as an output in the router.
     @Published private(set) var audioLink: BluetoothAudioSender?
     @Published private(set) var audioNote: String?
+    @Published private(set) var audioStatus: String?
+    private var audioStatusTimer: Timer?
     static let audioOutputUID = "amio-remote"
     private static let audioOutputID: AudioDeviceID = 0xFFFF_FF00
 
@@ -91,6 +93,8 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
         audioLink?.close()
         audioLink = nil
         audioNote = nil
+        audioStatusTimer?.invalidate(); audioStatusTimer = nil
+        audioStatus = nil
         audioCharacteristic = nil
         audioRequested = false
         central = nil
@@ -267,6 +271,8 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
                     MainActor.assumeIsolated {
                         guard let self else { return }
                         if self.audioLink != nil {
+                            self.audioStatusTimer?.invalidate(); self.audioStatusTimer = nil
+                            self.audioStatus = nil
                             self.audioLink = nil
                             self.audioNote = "소리 전송 채널이 닫혔습니다. 연결을 끊고 다시 시도하세요."
                         }
@@ -278,6 +284,10 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
             }
             audioLink = link
             audioNote = nil
+            audioStatusTimer?.invalidate()
+            audioStatusTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.audioStatus = self?.audioLink?.statusText }
+            }
         }
     }
 

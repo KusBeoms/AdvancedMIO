@@ -51,6 +51,8 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
     private var buildingService = false
     private var audioReceiver: BluetoothAudioReceiver?
     @Published private(set) var audioReceiving = false
+    @Published private(set) var audioStatus: String?
+    private var audioStatusTimer: Timer?
 
     func start() {
         guard enabled, manager == nil else { return }
@@ -93,6 +95,7 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
         code = ""
         remotes = [:]
         audioReceiver?.close()
+        stopAudioStatusTimer()
         buildingService = false
         status = .off
     }
@@ -130,8 +133,10 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
             audioReceiver = BluetoothAudioReceiver(
                 channel: channel, sink: AppModel.shared.remoteAudio,
                 authorize: { [weak self] in self?.authorizeAudio($0) ?? false },
+                outputLagMs: { AppModel.shared.worstOutputLagMs },
                 onAccepted: { [weak self] in
                     self?.audioReceiving = true
+                    self?.startAudioStatusTimer()
                     self?.noteRemote("소리 수신을 시작했습니다")
                     let model = AppModel.shared
                     if !model.running, !model.enabledOutputs.isEmpty { model.arm() }     // play it without a manual start
@@ -141,8 +146,21 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
                     self.audioReceiver = nil
                     if self.audioReceiving { self.noteRemote("소리 수신이 끝났습니다") }
                     self.audioReceiving = false
+                    self.stopAudioStatusTimer()
                 })
         }
+    }
+
+    private func startAudioStatusTimer() {
+        audioStatusTimer?.invalidate()
+        audioStatusTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.audioStatus = self?.audioReceiver?.statusText }
+        }
+    }
+
+    private func stopAudioStatusTimer() {
+        audioStatusTimer?.invalidate(); audioStatusTimer = nil
+        audioStatus = nil
     }
 
     private func authorizeAudio(_ candidate: String) -> Bool {

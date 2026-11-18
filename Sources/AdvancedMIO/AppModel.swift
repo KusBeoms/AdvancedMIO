@@ -112,6 +112,10 @@ final class AppModel: ObservableObject {
     var enabledOutputs: [AudioDeviceInfo] { outputDevices.filter { config($0.uid).enabled } }
     var micDevices: [AudioDeviceInfo] { devices.filter { $0.isInput && $0.uid != Self.virtualUID } }
     var sourceRate: Double? { deviceRates[Self.virtualUID] }
+    /// Delay from this Mac's router to the sound leaving the speakers (the laggiest enabled output). Reported to a sending Mac.
+    var worstOutputLagMs: Double { enabledOutputs.map { totalLag($0.uid) }.max() ?? 0 }
+    /// The Bluetooth link's latency is an estimate: round it so small wobbles do not keep re-aligning the other speakers.
+    static func roundedLatency(_ ms: Double) -> Double { (ms / 10).rounded() * 10 }
 
     // MARK: Init
 
@@ -170,6 +174,7 @@ final class AppModel: ObservableObject {
             if let r = HAL.nominalSampleRate(d.id) { rates[d.uid] = r }
         }
         if BluetoothRemote.shared.outputDevice != nil { rates[BluetoothRemote.audioOutputUID] = AudioFraming.sampleRate }
+        if let ms = BluetoothRemote.shared.audioLink?.estimatedLatencyMs { lat[BluetoothRemote.audioOutputUID] = Self.roundedLatency(ms) }
         hwLatencyMs = lat
         deviceRates = rates
         refreshHardwareVolumes()

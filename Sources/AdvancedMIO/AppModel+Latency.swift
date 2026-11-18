@@ -18,7 +18,16 @@ extension AppModel {
     func refreshLatencies() {
         guard !demo else { return }
         var next = hwLatencyMs
-        for d in outputDevices { if let ms = HAL.outputLatencyMs(d.id) { next[d.uid] = ms } }
+        for d in outputDevices where d.transport != .remote { if let ms = HAL.outputLatencyMs(d.id) { next[d.uid] = ms } }
+        // The connected Mac: its measured end-to-end latency acts as that output's "hardware latency", so the auto-align
+        // delays the other speakers to match. Only follow changes of 20 ms or more (the estimate wobbles a little).
+        let remoteUID = BluetoothRemote.audioOutputUID
+        if let ms = BluetoothRemote.shared.audioLink?.estimatedLatencyMs {
+            let rounded = Self.roundedLatency(ms)
+            if let old = next[remoteUID], abs(old - rounded) < 20 { /* keep */ } else { next[remoteUID] = rounded }
+        } else {
+            next[remoteUID] = nil
+        }
         let moved = next.contains { abs((hwLatencyMs[$0.key] ?? -1) - $0.value) > 0.01 }
         if moved {
             hwLatencyMs = next

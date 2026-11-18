@@ -8,7 +8,7 @@ struct BluetoothAccessView: View {
             BluetoothRemotePane().tabItem { Text("다른 Mac에 연결") }
         }
         .padding(16)
-        .frame(width: 462, height: 360)
+        .frame(width: 462, height: 380)
     }
 }
 
@@ -42,6 +42,7 @@ private struct BluetoothHostPane: View {
                 if host.audioReceiving {
                     Label("소리 수신 중 · 이 Mac의 켜 둔 출력 장치로 재생됩니다", systemImage: "speaker.wave.2.fill")
                         .foregroundStyle(.green)
+                    if let status = host.audioStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
                 }
                 if let event = host.lastRemoteEvent {
                     Label(event, systemImage: "antenna.radiowaves.left.and.right").foregroundStyle(.secondary)
@@ -110,6 +111,7 @@ private struct BluetoothRemotePane: View {
                 if remote.audioLink != nil {
                     Label("소리 전송 준비됨 · 메인 창 OUTPUTS에서 이 기기를 켜세요", systemImage: "speaker.wave.2.fill")
                         .foregroundStyle(.green)
+                    if let status = remote.audioStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
                 } else if let note = remote.audioNote {
                     Text(note).foregroundStyle(.secondary)
                 }

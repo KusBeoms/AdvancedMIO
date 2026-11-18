@@ -5,8 +5,10 @@ import Foundation
 public enum AudioFrameType: UInt8 {
     /// First frame from the sender: magic, six-digit access code, AAC magic cookie.
     case hello = 1
-    /// One AAC packet (1024 frames of 48 kHz stereo).
+    /// Sender → receiver: one AAC packet (1024 frames of 48 kHz stereo) with a sequence number and send time.
     case audio = 2
+    /// Receiver → sender: acknowledges a packet; carries what the sender needs for flow control and latency estimation.
+    case ack = 3
 }
 
 public struct AudioFrame: Equatable {
@@ -18,7 +20,9 @@ public enum AudioFraming {
     public static let sampleRate = 48_000.0
     public static let framesPerPacket = 1024
     public static let maxBody = 2048
-    private static let magic = Array("AMIO".utf8)
+    public static let blockSeconds = Double(framesPerPacket) / sampleRate
+    // "AMI2": the sequence/ack protocol. Older builds ("AMIO") are rejected cleanly instead of decoding garbage.
+    private static let magic = Array("AMI2".utf8)
 
     public static func encode(_ type: AudioFrameType, _ body: Data) -> Data {
         precondition(body.count <= maxBody, "frame body too large")
@@ -46,6 +50,62 @@ public enum AudioFraming {
         let n = Int(b[10])
         guard b.count == 11 + n else { return nil }
         return (code, Data(b[11...]))
+    }
+
+    static func le32(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8(v >> 24)] }
+    static func le16(_ v: UInt16) -> [UInt8] { [UInt8(v & 0xFF), UInt8(v >> 8)] }
+    static func read32(_ b: [UInt8], _ i: Int) -> UInt32 {
+        UInt32(b[i]) | UInt32(b[i + 1]) << 8 | UInt32(b[i + 2]) << 16 | UInt32(b[i + 3]) << 24
+    }
+    static func read16(_ b: [UInt8], _ i: Int) -> UInt16 { UInt16(b[i]) | UInt16(b[i + 1]) << 8 }
+}
+
+/// One AAC packet on the wire. `sendMs` is the sender's monotonic clock; only the sender interprets it (the receiver echoes it).
+public struct AudioPacket: Equatable {
+    public let sequence: UInt32
+    public let sendMs: UInt32
+    public let payload: Data
+
+    public init(sequence: UInt32, sendMs: UInt32, payload: Data) {
+        self.sequence = sequence; self.sendMs = sendMs; self.payload = payload
+    }
+
+    public init?(body: Data) {
+        let b = [UInt8](body)
+        guard b.count > 8 else { return nil }
+        sequence = AudioFraming.read32(b, 0)
+        sendMs = AudioFraming.read32(b, 4)
+        payload = Data(b[8...])
+    }
+
+    public var frame: Data {
+        AudioFraming.encode(.audio, Data(AudioFraming.le32(sequence) + AudioFraming.le32(sendMs)) + payload)
+    }
+}
+
+/// Receiver → sender. Sent for every packet, so the sender knows how much is still in flight and how long a round trip takes.
+public struct AudioAck: Equatable {
+    public let sequence: UInt32          // the packet being acknowledged
+    public let echoSendMs: UInt32        // that packet's `sendMs`, returned unchanged
+    public let bufferMs: UInt16          // audio waiting in the receiver's jitter buffer
+    public let outputLagMs: UInt16       // delay from the receiver's router to its speakers (laggiest enabled output)
+
+    public init(sequence: UInt32, echoSendMs: UInt32, bufferMs: UInt16, outputLagMs: UInt16) {
+        self.sequence = sequence; self.echoSendMs = echoSendMs; self.bufferMs = bufferMs; self.outputLagMs = outputLagMs
+    }
+
+    public init?(body: Data) {
+        let b = [UInt8](body)
+        guard b.count == 12 else { return nil }
+        sequence = AudioFraming.read32(b, 0)
+        echoSendMs = AudioFraming.read32(b, 4)
+        bufferMs = AudioFraming.read16(b, 8)
+        outputLagMs = AudioFraming.read16(b, 10)
+    }
+
+    public var frame: Data {
+        AudioFraming.encode(.ack, Data(AudioFraming.le32(sequence) + AudioFraming.le32(echoSendMs)
+                                       + AudioFraming.le16(bufferMs) + AudioFraming.le16(outputLagMs)))
     }
 }
 
