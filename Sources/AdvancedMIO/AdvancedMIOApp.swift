@@ -5,7 +5,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)      // also when launched via `swift run` (no .app bundle)
         NSApp.activate(ignoringOtherApps: true)
-        MainActor.assumeIsolated { HotKeys.shared.apply(enabled: AppModel.shared.hotkeysEnabled) }
+        MainActor.assumeIsolated {
+            HotKeys.shared.apply(enabled: AppModel.shared.hotkeysEnabled)
+            if !AppModel.shared.demo { Updater.shared.start() }
+        }
     }
     // Closing the window leaves the app (and the routing) running in the menu bar; quit from there or with ⌘Q.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

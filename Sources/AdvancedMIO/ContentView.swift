@@ -78,6 +78,8 @@ struct ContentView: View {
             Toggle("macOS에 지연 시간 알리기", isOn: Binding(get: { model.reportsLatencyToOS }, set: { model.setReportsLatencyToOS($0) }))
             Toggle("전역 단축키 (⌃⌥⌘ S · Z · 1–9)", isOn: Binding(get: { model.hotkeysEnabled }, set: { model.setHotkeys($0) }))
             Toggle("로그인 시 자동 실행", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
+            Divider()
+            UpdateMenuItems()
         } label: {
             Symbol("gearshape", size: 13)
                 .frame(width: 34, height: 34)
