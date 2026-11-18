@@ -54,7 +54,7 @@ enum AppWindow {
 
     @MainActor static func show() {
         NSApp.activate(ignoringOtherApps: true)
-        if let w = NSApp.windows.first(where: { $0.canBecomeMain && !($0 is NSPanel) }) {
+        if let w = NSApp.windows.first(where: { $0.title == "AdvancedMIO" && $0.canBecomeMain && !($0 is NSPanel) }) {
             w.makeKeyAndOrderFront(nil)
         } else {
             openFallback?()

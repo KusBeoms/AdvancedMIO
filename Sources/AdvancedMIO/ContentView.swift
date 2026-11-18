@@ -4,6 +4,7 @@ enum SideTab { case source, spatial }
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.openWindow) private var openWindow
     @State private var showHistory = false
     @State private var presetNameDraft = ""
     @State private var askPresetName = false
@@ -58,6 +59,18 @@ struct ContentView: View {
             }
             Spacer()
             StatusPill(running: model.capturing, armed: model.running)
+            Button { openWindow(id: "bluetooth") } label: {
+                HStack(spacing: 6) {
+                    Symbol("antenna.radiowaves.left.and.right", size: 13)
+                    Text("블루투스").font(.system(size: 12, weight: .semibold))
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 34)
+                .background(Capsule().fill(Color.white.opacity(0.08)))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("블루투스 연결")
+            .help("블루투스 연결")
             settingsMenu
             Button { model.refresh() } label: {
                 Symbol("arrow.clockwise", size: 13)

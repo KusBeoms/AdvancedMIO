@@ -7,7 +7,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         MainActor.assumeIsolated {
             HotKeys.shared.apply(enabled: AppModel.shared.hotkeysEnabled)
-            if !AppModel.shared.demo { Updater.shared.start() }
+            if !AppModel.shared.demo {
+                Updater.shared.start()
+                BluetoothHost.shared.start()
+            }
         }
     }
     // Closing the window leaves the app (and the routing) running in the menu bar; quit from there or with ⌘Q.
@@ -45,6 +48,11 @@ struct AdvancedMIOApp: App {
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentMinSize)
         .defaultSize(width: 1040, height: 700)
+
+        Window("블루투스 연결", id: "bluetooth") {
+            BluetoothAccessView().environmentObject(BluetoothHost.shared)
+        }
+        .windowResizability(.contentSize)
 
         MenuBarExtra {
             MenuBarContent().environmentObject(model)

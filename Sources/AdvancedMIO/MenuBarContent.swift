@@ -33,6 +33,7 @@ struct MenuBarContent: View {
 
         Divider()
         Button("창 열기") { openWindow(id: "main"); AppWindow.show() }
+        Button("블루투스 연결") { openWindow(id: "bluetooth"); NSApp.activate(ignoringOtherApps: true) }
         Menu("설정") {
             Toggle("지연 변화 경고 표시", isOn: Binding(get: { model.latencyWarningsEnabled }, set: { model.setLatencyWarnings($0) }))
             Toggle("macOS에 지연 시간 알리기", isOn: Binding(get: { model.reportsLatencyToOS }, set: { model.setReportsLatencyToOS($0) }))
