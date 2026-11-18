@@ -36,7 +36,7 @@ extension CalibrationReport {
 extension AppModel {
     func selectCalMic(_ uid: String) { calMics = [uid] }
 
-    var calSpeakers: [AudioDeviceInfo] { enabledOutputs }
+    var calSpeakers: [AudioDeviceInfo] { enabledOutputs.filter { $0.transport != .remote } }
     var canCalibrate: Bool { !demo && calPhase == .idle && calSpeakers.count >= 2 && !micDevices.isEmpty }
     var calEstimate: Double { CalibrationRunner.estimatedSeconds(speakers: calSpeakers.count, mics: max(1, calMics.count), wholeSong: calWholeSong) }
 

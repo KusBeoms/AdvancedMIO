@@ -109,6 +109,64 @@ private final class OutputState {
     }
 }
 
+/// Something an output state is rendered into: a Core Audio device, or the Bluetooth link to another Mac.
+private protocol OutputIO {
+    func start() throws
+    func stop()
+}
+extension DeviceIO: OutputIO {}
+
+/// An output that is not a Core Audio device: a timer pulls 1024-frame blocks through the same delay readers, volume,
+/// EQ and spatial mix as every device, and hands them to the Bluetooth sender (AAC-encoded there).
+private final class RemoteOutputIO: OutputIO {
+    private let state: OutputState
+    private let link: BluetoothAudioSender
+    private let queue = DispatchQueue(label: "advancedmio.remote-output", qos: .userInteractive)
+    private var timer: DispatchSourceTimer?
+    private let frames = AudioFraming.framesPerPacket
+    private let interleaved: UnsafeMutablePointer<Float>
+    private let l: UnsafeMutablePointer<Float>
+    private let r: UnsafeMutablePointer<Float>
+    private let list: UnsafeMutableAudioBufferListPointer
+
+    init(state: OutputState, link: BluetoothAudioSender) {
+        self.state = state
+        self.link = link
+        interleaved = .allocate(capacity: frames * 2)
+        l = .allocate(capacity: frames)
+        r = .allocate(capacity: frames)
+        list = AudioBufferList.allocate(maximumBuffers: 1)
+        list[0] = AudioBuffer(mNumberChannels: 2, mDataByteSize: UInt32(frames * 2 * MemoryLayout<Float>.size),
+                              mData: UnsafeMutableRawPointer(interleaved))
+    }
+
+    deinit {
+        stop()
+        interleaved.deallocate(); l.deallocate(); r.deallocate(); free(list.unsafeMutablePointer)
+    }
+
+    func start() throws {
+        guard link.isOpen else { throw IOError(message: "블루투스 연결이 끊겼습니다") }
+        let t = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        let period = Double(frames) / AudioFraming.sampleRate
+        t.schedule(deadline: .now(), repeating: .nanoseconds(Int(period * 1e9)), leeway: .microseconds(500))
+        t.setEventHandler { [weak self] in self?.tick() }
+        timer = t
+        t.resume()
+    }
+
+    func stop() {
+        timer?.cancel(); timer = nil
+        queue.sync {}
+    }
+
+    private func tick() {
+        state.process(list)
+        for i in 0..<frames { l[i] = interleaved[2 * i]; r[i] = interleaved[2 * i + 1] }
+        link.push(left: l, right: r)
+    }
+}
+
 /// Anything that continuously fills a `StereoRing` from a background thread (shared-memory driver feed, test probe).
 protocol RingSource: AnyObject {
     var ring: StereoRing { get }
@@ -120,17 +178,20 @@ protocol RingSource: AnyObject {
 /// Owns every IOProc. Create → `start()` → `stop()` (also on deinit).
 final class RouterEngine {
     private struct In { let device: AudioDeviceInfo; let io: DeviceIO; let state: InputState }
-    private struct Out { let device: AudioDeviceInfo; let io: DeviceIO; let state: OutputState; let rate: Double }
+    private struct Out { let device: AudioDeviceInfo; let io: OutputIO; let state: OutputState; let rate: Double }
     private var ins: [In] = []
     private var outs: [Out] = []
     /// Alternative to capturing an input device: audio arrives through the driver's shared memory (no mic indicator).
     private var shared: RingSource?
+    /// Extra rings mixed into every output (audio received over Bluetooth). Owned by the caller, so never fed or stopped here.
+    private let extras: [RingSource]
     /// Outputs that could not be set up or started. They are skipped so one bad device cannot silence the others.
     private(set) var failures: [(name: String, message: String)] = []
 
-    init(inputs: [AudioDeviceInfo], shared: RingSource? = nil,
+    init(inputs: [AudioDeviceInfo], shared: RingSource? = nil, extras: [RingSource] = [], remoteLink: BluetoothAudioSender? = nil,
          outputs: [(device: AudioDeviceInfo, delayMs: Double, volume: Double)]) throws {
         self.shared = shared
+        self.extras = extras
         do {
             for d in inputs {
                 let rate = try HAL.validateFloatIO(d.id, scope: kAudioObjectPropertyScopeInput)
@@ -143,15 +204,21 @@ final class RouterEngine {
             }
             for (d, delayMs, volume) in outputs {
                 do {
-                let rate = try HAL.validateFloatIO(d.id, scope: kAudioObjectPropertyScopeOutput)
-                let rings = ins.map { $0.state.ring } + (shared.map { [$0.ring] } ?? [])
+                let isRemote = d.transport == .remote
+                let rate = isRemote ? AudioFraming.sampleRate : try HAL.validateFloatIO(d.id, scope: kAudioObjectPropertyScopeOutput)
+                let rings = ins.map { $0.state.ring } + (shared.map { [$0.ring] } ?? []) + extras.map { $0.ring }
                 let readers = rings.map { DelayReader(ring: $0, outputSampleRate: rate, delayMs: delayMs) }
                 readers.forEach { $0.setGain(Float(volume)) }
                 let state = OutputState(readers: readers, sampleRate: rate)
-                let block: AudioDeviceIOBlock = { _, _, _, outData, _ in
-                    state.process(UnsafeMutableAudioBufferListPointer(outData))
+                if isRemote {
+                    guard let remoteLink, remoteLink.isOpen else { throw IOError(message: "연결된 다른 Mac이 없습니다") }
+                    outs.append(Out(device: d, io: RemoteOutputIO(state: state, link: remoteLink), state: state, rate: rate))
+                } else {
+                    let block: AudioDeviceIOBlock = { _, _, _, outData, _ in
+                        state.process(UnsafeMutableAudioBufferListPointer(outData))
+                    }
+                    outs.append(Out(device: d, io: try DeviceIO(deviceID: d.id, block: block), state: state, rate: rate))
                 }
-                outs.append(Out(device: d, io: try DeviceIO(deviceID: d.id, block: block), state: state, rate: rate))
                 } catch { failures.append((d.name, error.localizedDescription)) }
             }
             if outs.isEmpty, !outputs.isEmpty { throw IOError(message: failures.map { "\($0.name): \($0.message)" }.joined(separator: " · ")) }

@@ -8,6 +8,8 @@ enum BluetoothGATT {
     static let control = CBUUID(string: "7569D3E3-B156-4108-9DBC-B87F1B42F012")
     /// Subscribing to it is how a remote announces "I am connected" (Core Bluetooth reports no plain connections to a peripheral).
     static let presence = CBUUID(string: "7569D3E4-B156-4108-9DBC-B87F1B42F012")
+    /// Readable value: the L2CAP PSM (u16 LE) of the audio channel. Absent when the Mac could not publish one.
+    static let audio = CBUUID(string: "7569D3E5-B156-4108-9DBC-B87F1B42F012")
     static let needsBundle = "블루투스를 사용하려면 빌드한 AdvancedMIO.app을 실행하세요."
 
     static var hasUsageDescription: Bool {
@@ -46,6 +48,9 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
     private var gate = BluetoothAccessGate()
     private var manager: CBPeripheralManager?
     private var service: CBMutableService?
+    private var buildingService = false
+    private var audioReceiver: BluetoothAudioReceiver?
+    @Published private(set) var audioReceiving = false
 
     func start() {
         guard enabled, manager == nil else { return }
@@ -87,6 +92,8 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
         service = nil
         code = ""
         remotes = [:]
+        audioReceiver?.close()
+        buildingService = false
         status = .off
     }
 
@@ -96,23 +103,72 @@ final class BluetoothHost: NSObject, ObservableObject, CBPeripheralManagerDelega
             guard peripheral === manager else { return }
             guard peripheral.state == .poweredOn else {
                 service = nil
+                buildingService = false
                 status = peripheral.state == .resetting || peripheral.state == .unknown
                     ? .starting : .unavailable(BluetoothGATT.unavailableMessage(for: peripheral.state))
                 return
             }
-            guard service == nil else { return }
+            guard service == nil, !buildingService else { return }
             status = .starting
-            let identity = CBMutableCharacteristic(type: BluetoothGATT.identity, properties: .read,
-                                                   value: Data(name.utf8), permissions: .readable)
-            let control = CBMutableCharacteristic(type: BluetoothGATT.control, properties: .write,
-                                                  value: nil, permissions: [.writeable, .writeEncryptionRequired])
-            let service = CBMutableService(type: BluetoothGATT.service, primary: true)
-            let presence = CBMutableCharacteristic(type: BluetoothGATT.presence, properties: [.notify, .read],
-                                                   value: nil, permissions: .readable)
-            service.characteristics = [identity, control, presence]
-            self.service = service
-            peripheral.add(service)
+            buildingService = true
+            // The audio channel is published first: its PSM goes into the service's audio characteristic.
+            peripheral.publishL2CAPChannel(withEncryption: true)
         }
+    }
+
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, didPublishL2CAPChannel PSM: CBL2CAPPSM, error: Error?) {
+        MainActor.assumeIsolated {
+            guard peripheral === manager, peripheral.state == .poweredOn else { return }
+            addService(to: peripheral, psm: error == nil ? PSM : nil)      // without audio, remote control still works
+        }
+    }
+
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, didOpen channel: CBL2CAPChannel?, error: Error?) {
+        MainActor.assumeIsolated {
+            guard peripheral === manager, error == nil, let channel else { return }
+            audioReceiver?.close()
+            audioReceiver = BluetoothAudioReceiver(
+                channel: channel, sink: AppModel.shared.remoteAudio,
+                authorize: { [weak self] in self?.authorizeAudio($0) ?? false },
+                onAccepted: { [weak self] in
+                    self?.audioReceiving = true
+                    self?.noteRemote("소리 수신을 시작했습니다")
+                    let model = AppModel.shared
+                    if !model.running, !model.enabledOutputs.isEmpty { model.arm() }     // play it without a manual start
+                },
+                onClosed: { [weak self] receiver in
+                    guard let self, self.audioReceiver === receiver else { return }
+                    self.audioReceiver = nil
+                    if self.audioReceiving { self.noteRemote("소리 수신이 끝났습니다") }
+                    self.audioReceiving = false
+                })
+        }
+    }
+
+    private func authorizeAudio(_ candidate: String) -> Bool {
+        guard let request = BluetoothControlRequest(code: candidate) else { return false }
+        let result = gate.authorize(request, uptime: ProcessInfo.processInfo.systemUptime)
+        if code != gate.code { code = gate.code }
+        return result == .allowed
+    }
+
+    private func addService(to peripheral: CBPeripheralManager, psm: CBL2CAPPSM?) {
+        let identity = CBMutableCharacteristic(type: BluetoothGATT.identity, properties: .read,
+                                               value: Data(name.utf8), permissions: .readable)
+        let control = CBMutableCharacteristic(type: BluetoothGATT.control, properties: .write,
+                                              value: nil, permissions: [.writeable, .writeEncryptionRequired])
+        let service = CBMutableService(type: BluetoothGATT.service, primary: true)
+        let presence = CBMutableCharacteristic(type: BluetoothGATT.presence, properties: [.notify, .read],
+                                               value: nil, permissions: .readable)
+        var characteristics = [identity, control, presence]
+        if let psm {
+            var le = psm.littleEndian
+            characteristics.append(CBMutableCharacteristic(type: BluetoothGATT.audio, properties: .read,
+                                                           value: Data(bytes: &le, count: 2), permissions: .readable))
+        }
+        service.characteristics = characteristics
+        self.service = service
+        peripheral.add(service)
     }
 
     nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {

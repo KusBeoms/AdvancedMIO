@@ -2,7 +2,7 @@ import CoreAudio
 import Foundation
 
 enum DeviceTransport {
-    case builtIn, usb, bluetooth, hdmi, airplay, thunderbolt, virtual, aggregate, other
+    case builtIn, usb, bluetooth, hdmi, airplay, thunderbolt, virtual, aggregate, remote, other
 
     var label: String {
         switch self {
@@ -14,6 +14,7 @@ enum DeviceTransport {
         case .thunderbolt: return "Thunderbolt"
         case .virtual: return "가상"
         case .aggregate: return "통합"
+        case .remote: return "블루투스 · 다른 Mac"
         case .other: return "기타"
         }
     }
@@ -44,6 +45,7 @@ struct AudioDeviceInfo: Identifiable, Hashable {
         case .thunderbolt: return "bolt.horizontal.fill"
         case .virtual: return "waveform.path"
         case .aggregate: return "rectangle.3.group"
+        case .remote: return "macbook.and.iphone"
         case .other: return forOutput ? "speaker.wave.2.fill" : "mic.fill"
         }
     }

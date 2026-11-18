@@ -1,3 +1,4 @@
+@preconcurrency import CoreAudio
 @preconcurrency import CoreBluetooth
 import MIOCore
 import SwiftUI
@@ -21,11 +22,25 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
     @Published private(set) var message: String?
     @Published private(set) var lastAction: BluetoothControlAction?
     @Published private var pending: BluetoothControlRequest?
+    /// The open audio channel to the connected Mac. While it exists, that Mac is offered as an output in the router.
+    @Published private(set) var audioLink: BluetoothAudioSender?
+    @Published private(set) var audioNote: String?
+    static let audioOutputUID = "amio-remote"
+    private static let audioOutputID: AudioDeviceID = 0xFFFF_FF00
+
+    /// The connected Mac as an output device card (nil until the audio channel is open).
+    var outputDevice: AudioDeviceInfo? {
+        guard phase == .connected, let link = audioLink, link.isOpen else { return nil }
+        return AudioDeviceInfo(id: Self.audioOutputID, uid: Self.audioOutputUID, name: "\(deviceName) · 다른 Mac",
+                               inputChannels: 0, outputChannels: 2, transport: .remote)
+    }
     var sending: Bool { pending != nil }
 
     private var central: CBCentralManager?
     private var connection: CBPeripheral?
     private var control: CBCharacteristic?
+    private var audioCharacteristic: CBCharacteristic?
+    private var audioRequested = false
     private var code: String?
     private var timeout: Task<Void, Never>?
 
@@ -73,6 +88,11 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
             }
         }
         connection?.delegate = nil
+        audioLink?.close()
+        audioLink = nil
+        audioNote = nil
+        audioCharacteristic = nil
+        audioRequested = false
         central = nil
         connection = nil
         control = nil
@@ -179,7 +199,7 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
                 fail("이 기기에서 AdvancedMIO 서비스를 찾지 못했습니다.")
                 return
             }
-            peripheral.discoverCharacteristics([BluetoothGATT.identity, BluetoothGATT.control, BluetoothGATT.presence], for: service)
+            peripheral.discoverCharacteristics([BluetoothGATT.identity, BluetoothGATT.control, BluetoothGATT.presence, BluetoothGATT.audio], for: service)
         }
     }
 
@@ -193,6 +213,7 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
                 return
             }
             self.control = control
+            audioCharacteristic = service.characteristics?.first { $0.uuid == BluetoothGATT.audio && $0.properties.contains(.read) }
             if let presence = service.characteristics?.first(where: { $0.uuid == BluetoothGATT.presence }) {
                 peripheral.setNotifyValue(true, for: presence)      // lets the Mac show that this remote is connected
             }
@@ -202,6 +223,14 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         MainActor.assumeIsolated {
+            if peripheral === connection, characteristic.uuid == BluetoothGATT.audio {
+                guard error == nil, let value = characteristic.value, value.count == 2 else {
+                    audioNote = "소리 전송 채널 정보를 읽지 못했습니다."
+                    return
+                }
+                peripheral.openL2CAPChannel(CBL2CAPPSM(value[value.startIndex]) | CBL2CAPPSM(value[value.startIndex + 1]) << 8)
+                return
+            }
             guard peripheral === connection, characteristic.uuid == BluetoothGATT.identity, phase == .connecting else { return }
             guard error == nil, let value = characteristic.value, value.count == 8,
                   let name = String(data: value, encoding: .ascii), name.hasPrefix("MIO-") else {
@@ -211,6 +240,44 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
             timeout?.cancel()
             deviceName = name
             phase = .enteringCode
+        }
+    }
+
+    /// Reads the audio channel's PSM once after the code was accepted; `didOpen` below completes the setup.
+    private func openAudioChannel(on peripheral: CBPeripheral) {
+        guard !audioRequested, audioLink == nil else { return }
+        audioRequested = true
+        guard let audioCharacteristic else {
+            audioNote = "상대 Mac의 AdvancedMIO가 소리 수신을 지원하지 않습니다. 양쪽을 같은 최신 버전으로 맞추세요."
+            return
+        }
+        audioNote = "소리 전송 채널을 여는 중…"
+        peripheral.readValue(for: audioCharacteristic)
+    }
+
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
+        MainActor.assumeIsolated {
+            guard peripheral === connection, phase == .connected else { return }
+            guard error == nil, let channel, let code else {
+                audioNote = "소리 전송 채널을 열지 못했습니다. 연결을 끊고 다시 시도하세요."
+                return
+            }
+            guard let link = BluetoothAudioSender(channel: channel, code: code, onClosed: { [weak self] in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        if self.audioLink != nil {
+                            self.audioLink = nil
+                            self.audioNote = "소리 전송 채널이 닫혔습니다. 연결을 끊고 다시 시도하세요."
+                        }
+                    }
+                }
+            }) else {
+                audioNote = "소리 인코더를 만들지 못했습니다."
+                return
+            }
+            audioLink = link
+            audioNote = nil
         }
     }
 
@@ -230,6 +297,7 @@ final class BluetoothRemote: NSObject, ObservableObject, CBCentralManagerDelegat
                 code = request.code
                 phase = .connected
                 lastAction = request.action
+                openAudioChannel(on: peripheral)
                 return
             }
 

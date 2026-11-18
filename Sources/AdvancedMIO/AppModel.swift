@@ -1,3 +1,4 @@
+import Combine
 import AppKit
 import AVFoundation
 import CoreAudio
@@ -93,6 +94,10 @@ final class AppModel: ObservableObject {
     private var listenerBlock: AudioObjectPropertyListenerBlock?
     /// Audio from the driver's shared memory (no microphone indicator). nil → older driver, falls back to capturing the input.
     fileprivate(set) var shared: SharedRingSource?
+    /// Audio received over Bluetooth from another Mac; mixed into every output while it plays.
+    let remoteAudio = RemoteAudioSource()
+    private var remoteObserver: AnyCancellable?
+    private var remoteWasAvailable = false
     var demo = false
 
     // MARK: Derived
@@ -100,7 +105,9 @@ final class AppModel: ObservableObject {
     /// The virtual "AdvancedMIO" device: what the user picks in Control Center. Its loopback input is our only source.
     var virtualDevice: AudioDeviceInfo? { devices.first { $0.uid == Self.virtualUID && $0.isInput } }
     /// Real outputs only; the virtual device itself would feed back into the router.
-    var outputDevices: [AudioDeviceInfo] { devices.filter { $0.isOutput && $0.uid != Self.virtualUID } }
+    var outputDevices: [AudioDeviceInfo] {
+        devices.filter { $0.isOutput && $0.uid != Self.virtualUID } + (BluetoothRemote.shared.outputDevice.map { [$0] } ?? [])
+    }
     /// Enabled outputs in a stable order (the order the default slots are handed out in).
     var enabledOutputs: [AudioDeviceInfo] { outputDevices.filter { config($0.uid).enabled } }
     var micDevices: [AudioDeviceInfo] { devices.filter { $0.isInput && $0.uid != Self.virtualUID } }
@@ -123,6 +130,9 @@ final class AppModel: ObservableObject {
         reportsLatencyToOS = UserDefaults.standard.object(forKey: "reportLatencyToOS") as? Bool ?? true
         refresh()
         installDeviceListener()
+        remoteObserver = BluetoothRemote.shared.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.remoteLinkChanged() } }
+        }
         // Don't leave a stale latency behind in the driver once the app is gone.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { AppModel.shared.shared?.setReportedLatency(frames: 0) }
@@ -134,6 +144,16 @@ final class AppModel: ObservableObject {
     }
 
     /// Once a second: follow volume changes made elsewhere (keys, Sound settings); every few seconds re-read latencies.
+    /// The connected Mac appeared as an output or went away: refresh the list, and drop it from a running engine.
+    private func remoteLinkChanged() {
+        objectWillChange.send()
+        let available = BluetoothRemote.shared.outputDevice != nil
+        guard available != remoteWasAvailable else { return }
+        remoteWasAvailable = available
+        refresh()
+        if engine != nil, config(BluetoothRemote.audioOutputUID).enabled { rebuildEngine() }
+    }
+
     private func slowTick() {
         refreshHardwareVolumes()
         hwTicks += 1
@@ -149,6 +169,7 @@ final class AppModel: ObservableObject {
             if d.isOutput, let ms = HAL.outputLatencyMs(d.id) { lat[d.uid] = ms }
             if let r = HAL.nominalSampleRate(d.id) { rates[d.uid] = r }
         }
+        if BluetoothRemote.shared.outputDevice != nil { rates[BluetoothRemote.audioOutputUID] = AudioFraming.sampleRate }
         hwLatencyMs = lat
         deviceRates = rates
         refreshHardwareVolumes()
@@ -173,7 +194,8 @@ final class AppModel: ObservableObject {
         refresh()
         guard running else { return }
         let present = Set(devices.map(\.uid))
-        let used = Set(outputs.filter { $0.value.enabled }.keys).union([Self.virtualUID])
+        // The Bluetooth output is not a Core Audio device; losing it only drops that output (see remoteLinkChanged).
+        let used = Set(outputs.filter { $0.value.enabled && $0.key != BluetoothRemote.audioOutputUID }.keys).union([Self.virtualUID])
         if !used.isSubset(of: present) {
             disarm()
             error = "사용 중이던 오디오 장치가 분리되어 정지했습니다"
@@ -186,7 +208,7 @@ final class AppModel: ObservableObject {
         var next: [String: Double] = [:]
         // Virtual / aggregate devices report a volume control that does not change what is heard: those are always
         // adjusted in software (digital gain inside the router).
-        for d in outputDevices where d.transport != .virtual && d.transport != .aggregate {
+        for d in outputDevices where d.transport != .virtual && d.transport != .aggregate && d.transport != .remote {
             if let v = HAL.hardwareVolume(d.id) { next[d.uid] = Double(v) }
         }
         if next.count != hwVolume.count || next.contains(where: { abs((hwVolume[$0.key] ?? -1) - $0.value) > 0.004 }) { hwVolume = next }
@@ -397,8 +419,10 @@ final class AppModel: ObservableObject {
         // Shared memory: audio is flowing when the driver's write position moved. Otherwise ask the driver how many
         // clients play; an older driver without that counter means we simply always capture.
         let playing: Bool
-        if let shared { playing = shared.pollActivity() }
-        else { playing = virtualDevice.flatMap { HAL.playbackClients($0.id) }.map { $0 > 0 } ?? true }
+        let local: Bool
+        if let shared { local = shared.pollActivity() }
+        else { local = virtualDevice.flatMap { HAL.playbackClients($0.id) }.map { $0 > 0 } ?? true }
+        playing = local || remoteAudio.isActive
         if playing {
             idleSince = nil
             if engine == nil { rebuildEngine() }
@@ -423,7 +447,7 @@ final class AppModel: ObservableObject {
             let outs = enabledOutputs
             guard !outs.isEmpty else { error = "출력 장치를 하나 이상 켜세요"; return }
             do {
-                let e = try RouterEngine(inputs: ins, shared: shared, outputs: outs.map { ($0, appliedDelayMs($0.uid), digitalVolume($0.uid)) })
+                let e = try RouterEngine(inputs: ins, shared: shared, extras: [remoteAudio], remoteLink: BluetoothRemote.shared.audioLink, outputs: outs.map { ($0, appliedDelayMs($0.uid), digitalVolume($0.uid)) })
                 try e.start()
                 engine = e
                 pushMixes()

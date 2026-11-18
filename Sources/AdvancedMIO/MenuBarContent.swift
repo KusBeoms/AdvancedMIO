@@ -46,7 +46,7 @@ struct MenuBarContent: View {
             }
         }
         if !host.remotes.isEmpty {
-            Text("원격 접속 \(host.remotes.count)대 (인증 \(host.authenticatedCount)대)")
+            Text("원격 접속 \(host.remotes.count)대 (인증 \(host.authenticatedCount)대)" + (host.audioReceiving ? " · 소리 수신 중" : ""))
         }
         Button("블루투스 연결") { openWindow(id: "bluetooth"); NSApp.activate(ignoringOtherApps: true) }
         Menu("설정") {
