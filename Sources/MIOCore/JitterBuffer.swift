@@ -22,6 +22,8 @@ public struct JitterBuffer {
     public private(set) var underruns = 0
     public private(set) var dropped = 0
     private var blocks: [Block] = []
+    private static let burstSlack = 4
+    private static let growStep = 2
     private var primed = false
     private var calmTicks = 0
     private let calmTicksBeforeShrink: Int
@@ -38,8 +40,9 @@ public struct JitterBuffer {
 
     public mutating func push(_ block: Block) {
         blocks.append(block)
-        // Far more than the cushion: the sender's clock runs fast or a burst arrived. Drop the oldest audio, not the newest.
-        if blocks.count > target + 3 {
+        // Far more than the cushion: the sender's clock runs fast or a long stall ended in a burst. A stall of up to
+        // ~4 blocks beyond the cushion is absorbed; only beyond that is the oldest audio dropped (never the newest).
+        if blocks.count > target + Self.burstSlack {
             let excess = blocks.count - (target + 1)
             blocks.removeFirst(excess)
             dropped += excess
@@ -55,7 +58,7 @@ public struct JitterBuffer {
         guard !blocks.isEmpty else {
             primed = false
             underruns += 1
-            target = min(maxTarget, target + 1)
+            target = min(maxTarget, target + Self.growStep)     // a spike happened: be ready for the next one sooner
             calmTicks = 0
             return .underrun
         }

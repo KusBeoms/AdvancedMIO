@@ -45,6 +45,11 @@ struct MenuBarContent: View {
                 Button("연결 끊기") { remote.close() }
             }
         }
+        if remote.phase == .reconnecting {
+            Menu("원격 재연결 중: \(remote.deviceName)") {
+                Button("연결 끊기") { remote.close() }
+            }
+        }
         if !host.remotes.isEmpty {
             Text("원격 접속 \(host.remotes.count)대 (인증 \(host.authenticatedCount)대)" + (host.audioReceiving ? " · 소리 수신 중" : ""))
         }

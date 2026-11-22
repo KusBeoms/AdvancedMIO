@@ -174,6 +174,9 @@ final class AppModel: ObservableObject {
         }
         if BluetoothRemote.shared.outputDevice != nil { rates[BluetoothRemote.audioOutputUID] = AudioFraming.sampleRate }
         if let ms = BluetoothRemote.shared.audioLink?.estimatedLatencyMs { lat[BluetoothRemote.audioOutputUID] = Self.roundedLatency(ms) }
+        else if BluetoothRemote.shared.outputDevice != nil, let kept = hwLatencyMs[BluetoothRemote.audioOutputUID] {
+            lat[BluetoothRemote.audioOutputUID] = kept      // link briefly down: do not shift the other speakers' alignment
+        }
         hwLatencyMs = lat
         deviceRates = rates
         refreshHardwareVolumes()
@@ -461,7 +464,7 @@ final class AppModel: ObservableObject {
             let outs = enabledOutputs
             guard !outs.isEmpty else { error = "출력 장치를 하나 이상 켜세요"; return }
             do {
-                let e = try RouterEngine(inputs: ins, shared: shared, extras: [remoteAudio], remoteLink: BluetoothRemote.shared.audioLink, outputs: outs.map { ($0, appliedDelayMs($0.uid), digitalVolume($0.uid)) })
+                let e = try RouterEngine(inputs: ins, shared: shared, extras: [remoteAudio], remoteLink: BluetoothRemote.shared.linkBox, outputs: outs.map { ($0, appliedDelayMs($0.uid), digitalVolume($0.uid)) })
                 try e.start()
                 engine = e
                 pushMixes()

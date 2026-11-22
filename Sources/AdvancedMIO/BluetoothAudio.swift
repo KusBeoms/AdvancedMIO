@@ -6,6 +6,17 @@ private func monotonicMs() -> UInt32 {
     UInt32(truncatingIfNeeded: DispatchTime.now().uptimeNanoseconds / 1_000_000)
 }
 
+/// Lets a running router engine keep its remote output across Bluetooth reconnects: the output pushes into whatever
+/// sender is current (or drops the block while the link is down), so local outputs never have to be rebuilt.
+final class RemoteLinkBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var link: BluetoothAudioSender?
+    var current: BluetoothAudioSender? {
+        get { lock.lock(); defer { lock.unlock() }; return link }
+        set { lock.lock(); link = newValue; lock.unlock() }
+    }
+}
+
 /// Audio that arrived over Bluetooth, as one more ring the router mixes into every enabled output
 /// (next to the system audio coming from the AdvancedMIO virtual device).
 final class RemoteAudioSource: RingSource, @unchecked Sendable {
@@ -13,6 +24,10 @@ final class RemoteAudioSource: RingSource, @unchecked Sendable {
     private let lock = NSLock()
     private var peak: Float = 0
     private var lastWrite = -Double.infinity
+
+    private var learnedTarget = 3
+    /// The jitter cushion the last connection settled on. A reconnect starts from it instead of relearning every spike.
+    var jitterTarget: Int { get { lock.lock(); defer { lock.unlock() }; return learnedTarget } set { lock.lock(); learnedTarget = newValue; lock.unlock() } }
 
     var level: Float { lock.lock(); defer { lock.unlock() }; return peak }
     /// True while blocks keep arriving; keeps the router running while only remote audio plays.
@@ -34,7 +49,7 @@ final class RemoteAudioSource: RingSource, @unchecked Sendable {
 final class RemotePlayout: @unchecked Sendable {
     private let sink: RemoteAudioSource
     private let lock = NSLock()
-    private var jitter = JitterBuffer()
+    private var jitter: JitterBuffer
     private let queue = DispatchQueue(label: "advancedmio.remote-playout", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
     private var clockRunning = false
@@ -42,7 +57,10 @@ final class RemotePlayout: @unchecked Sendable {
     private let silence = [Float](repeating: 0, count: AudioFraming.framesPerPacket)
     private static let blockNs = UInt64(AudioFraming.blockSeconds * 1e9)
 
-    init(sink: RemoteAudioSource) { self.sink = sink }
+    init(sink: RemoteAudioSource) {
+        self.sink = sink
+        jitter = JitterBuffer(target: sink.jitterTarget)
+    }
 
     /// Returns true on the first block of a new burst, so the receiver can start its outputs while buffering.
     func push(left: UnsafePointer<Float>, right: UnsafePointer<Float>, frames: Int) -> Bool {
@@ -84,6 +102,7 @@ final class RemotePlayout: @unchecked Sendable {
     private func tick(_ t: DispatchSourceTimer) {
         lock.lock()
         let output = jitter.pop()
+        if sink.jitterTarget != jitter.target { sink.jitterTarget = jitter.target }
         if case .block = output {
             let period = UInt64(Double(Self.blockNs) / jitter.playoutRate)
             nextNs = max(nextNs + period, DispatchTime.now().uptimeNanoseconds)
@@ -238,12 +257,13 @@ final class BluetoothAudioSender: NSObject, StreamDelegate, @unchecked Sendable 
     private var remoteBufferMs = 0.0
     private var remoteOutputLagMs = 0.0
     private var haveAck = false
-    private let onClosed: @Sendable () -> Void
+    private var lastAckMs = monotonicMs()
+    private let onClosed: @Sendable (BluetoothAudioSender) -> Void
 
     /// About 0.2 s of audio in flight.
     private static let window = 10
 
-    init?(channel: CBL2CAPChannel, code: String, bitRate: Int, onClosed: @escaping @Sendable () -> Void) {
+    init?(channel: CBL2CAPChannel, code: String, bitRate: Int, onClosed: @escaping @Sendable (BluetoothAudioSender) -> Void) {
         guard let encoder = AACEncoder(bitRate: bitRate), let hello = AudioFraming.hello(code: code, cookie: encoder.cookie) else { return nil }
         self.channel = channel
         self.encoder = encoder
@@ -260,6 +280,14 @@ final class BluetoothAudioSender: NSObject, StreamDelegate, @unchecked Sendable 
     }
 
     var isOpen: Bool { lock.lock(); defer { lock.unlock() }; return !closed }
+
+    /// True when packets are waiting for an acknowledgement and none has arrived for `seconds`: the link looks dead
+    /// even though the streams report no error (the other Mac went out of range or hung). Idle links never count.
+    func isStalled(for seconds: Double) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed, nextSequence != oldestUnacknowledged else { return false }
+        return Double(monotonicMs() &- lastAckMs) > seconds * 1000
+    }
 
     /// Estimated delay from handing audio to this sender until it is audible on the receiving Mac's speakers, in ms.
     /// nil until the first acknowledgement arrives.
@@ -295,6 +323,7 @@ final class BluetoothAudioSender: NSObject, StreamDelegate, @unchecked Sendable 
         defer { lock.unlock() }
         guard !closed else { return }
         guard payload.count <= AudioFraming.maxBody - 8 else { droppedPackets += 1; return }
+        if nextSequence == oldestUnacknowledged { lastAckMs = monotonicMs() }      // the stall clock starts with the first unacknowledged packet
         let packet = AudioPacket(sequence: nextSequence, sendMs: monotonicMs(), payload: payload)
         nextSequence &+= 1
         sentPackets += 1
@@ -316,7 +345,7 @@ final class BluetoothAudioSender: NSObject, StreamDelegate, @unchecked Sendable 
                 stream?.close()
             }
         }
-        onClosed()
+        onClosed(self)
     }
 
     private func flush() {
@@ -346,7 +375,8 @@ final class BluetoothAudioSender: NSObject, StreamDelegate, @unchecked Sendable 
             oldestUnacknowledged = ack.sequence &+ 1
             let rtt = Double(now &- ack.echoSendMs)
             if rtt >= 0, rtt < 10_000 { rttMs = haveAck ? rttMs * 0.9 + rtt * 0.1 : rtt }
-            remoteBufferMs = Double(ack.bufferMs)
+            remoteBufferMs = haveAck ? remoteBufferMs * 0.9 + Double(ack.bufferMs) * 0.1 : Double(ack.bufferMs)   // smoothed: the cushion breathes
+            lastAckMs = now
             remoteOutputLagMs = Double(ack.outputLagMs)
             haveAck = true
         }

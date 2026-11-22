@@ -124,20 +124,19 @@ extension DeviceIO: OutputIO {}
 /// EQ and spatial mix as every device, and hands them to the Bluetooth sender (AAC-encoded there).
 private final class RemoteOutputIO: OutputIO {
     private let state: OutputState
-    private let link: BluetoothAudioSender
+    private let box: RemoteLinkBox
     private let queue = DispatchQueue(label: "advancedmio.remote-output", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
     private let frames = AudioFraming.framesPerPacket
 
-    init(state: OutputState, link: BluetoothAudioSender) {
+    init(state: OutputState, box: RemoteLinkBox) {
         self.state = state
-        self.link = link
+        self.box = box
     }
 
     deinit { stop() }
 
     func start() throws {
-        guard link.isOpen else { throw IOError(message: "블루투스 연결이 끊겼습니다") }
         let t = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
         let period = Double(frames) / AudioFraming.sampleRate
         t.schedule(deadline: .now(), repeating: .nanoseconds(Int(period * 1e9)), leeway: .microseconds(500))
@@ -153,7 +152,7 @@ private final class RemoteOutputIO: OutputIO {
 
     private func tick() {
         state.render(frames: frames)
-        link.push(left: state.l, right: state.r)
+        box.current?.push(left: state.l, right: state.r)      // dropped while the link is being re-established
     }
 }
 
@@ -178,7 +177,7 @@ final class RouterEngine {
     /// Outputs that could not be set up or started. They are skipped so one bad device cannot silence the others.
     private(set) var failures: [(name: String, message: String)] = []
 
-    init(inputs: [AudioDeviceInfo], shared: RingSource? = nil, extras: [RingSource] = [], remoteLink: BluetoothAudioSender? = nil,
+    init(inputs: [AudioDeviceInfo], shared: RingSource? = nil, extras: [RingSource] = [], remoteLink: RemoteLinkBox? = nil,
          outputs: [(device: AudioDeviceInfo, delayMs: Double, volume: Double)]) throws {
         self.shared = shared
         self.extras = extras
@@ -201,8 +200,8 @@ final class RouterEngine {
                 readers.forEach { $0.setGain(Float(volume)) }
                 let state = OutputState(readers: readers, sampleRate: rate)
                 if isRemote {
-                    guard let remoteLink, remoteLink.isOpen else { throw IOError(message: "연결된 다른 Mac이 없습니다") }
-                    outs.append(Out(device: d, io: RemoteOutputIO(state: state, link: remoteLink), state: state, rate: rate))
+                    guard let remoteLink else { throw IOError(message: "연결된 다른 Mac이 없습니다") }
+                    outs.append(Out(device: d, io: RemoteOutputIO(state: state, box: remoteLink), state: state, rate: rate))
                 } else {
                     let block: AudioDeviceIOBlock = { _, _, _, outData, _ in
                         state.process(UnsafeMutableAudioBufferListPointer(outData))

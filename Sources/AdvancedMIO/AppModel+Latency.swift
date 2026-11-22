@@ -25,9 +25,9 @@ extension AppModel {
         if let ms = BluetoothRemote.shared.audioLink?.estimatedLatencyMs {
             let rounded = Self.roundedLatency(ms)
             if let old = next[remoteUID], abs(old - rounded) < 20 { /* keep */ } else { next[remoteUID] = rounded }
-        } else {
+        } else if BluetoothRemote.shared.outputDevice == nil {
             next[remoteUID] = nil
-        }
+        }       // else: the link is being re-established. Keep the last value so the other speakers stay aligned.
         let moved = next.contains { abs((hwLatencyMs[$0.key] ?? -1) - $0.value) > 0.01 }
         if moved {
             hwLatencyMs = next

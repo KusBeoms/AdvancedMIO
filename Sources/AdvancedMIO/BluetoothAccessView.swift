@@ -80,6 +80,15 @@ private struct BluetoothRemotePane: View {
                     Spacer()
                     Button("취소") { remote.close() }
                 }
+            case .reconnecting:
+                deviceHeader
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("연결이 끊겨 자동으로 다시 연결하는 중…")
+                }
+                if let message = remote.message { Text(message).font(.caption).foregroundStyle(.secondary) }
+                Text("상대 Mac이 범위 안에 있으면 코드를 다시 입력하지 않아도 소리와 제어가 이어집니다.")
+                    .font(.caption).foregroundStyle(.secondary)
             case .enteringCode:
                 deviceHeader
                 Picker("소리 전송 음질", selection: $remote.audioQuality) {

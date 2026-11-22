@@ -65,6 +65,7 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Symbol("antenna.radiowaves.left.and.right", size: 13)
                     Text(remote.phase == .connected ? "연결됨 · \(remote.deviceName)"
+                         : remote.phase == .reconnecting ? "재연결 중 · \(remote.deviceName)"
                          : bluetoothHost.remotes.isEmpty ? "블루투스" : "원격 접속 \(bluetoothHost.remotes.count)대")
                         .font(.system(size: 12, weight: .semibold))
                 }
